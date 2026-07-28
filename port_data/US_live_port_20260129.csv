@@ -601,7 +601,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,SD,11023,15.67
 1/29/2026,US_live_port,AAON,-307,93.31
 1/29/2026,US_live_port,BJRI,1532,41.69
-1/29/2026,US_live_port,BK,2840,#N/A N/A
 1/29/2026,US_live_port,CRK,-4625,23.35
 1/29/2026,US_live_port,CPS,15,32.5
 1/29/2026,US_live_port,PFGC,1726,98.16
@@ -629,7 +628,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,MMS,374,94.17
 1/29/2026,US_live_port,CCEP,6323,91.22
 1/29/2026,US_live_port,TRU,2037,80.68
-1/29/2026,US_live_port,VSCO,22,#N/A N/A
 1/29/2026,US_live_port,GM,2784,86.26
 1/29/2026,US_live_port,RDWR,1339,24.26
 1/29/2026,US_live_port,CWEN,9119,36.27
@@ -700,7 +698,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,AAOI,2064,39.57
 1/29/2026,US_live_port,PGEN,-15789,4.53
 1/29/2026,US_live_port,BLX,23,48.77
-1/29/2026,US_live_port,ASGN,-7661,#N/A N/A
 1/29/2026,US_live_port,UHS,2554,200.13
 1/29/2026,US_live_port,GFF,3633,81.77
 1/29/2026,US_live_port,RNG,-1495,25.56
@@ -726,7 +723,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,IVZ,2958,27.72
 1/29/2026,US_live_port,WIX,3133,89.97
 1/29/2026,US_live_port,NXRT,2244,29.97
-1/29/2026,US_live_port,AHH,2506,#N/A N/A
 1/29/2026,US_live_port,HCA,438,482.53
 1/29/2026,US_live_port,WMS,-1647,153.22
 1/29/2026,US_live_port,HBAN,26419,17.29
@@ -756,7 +752,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,OKTA,-4636,85.69
 1/29/2026,US_live_port,NRIM,2255,22.88
 1/29/2026,US_live_port,IONS,5944,83.88
-1/29/2026,US_live_port,PSTG,-3733,#N/A N/A
 1/29/2026,US_live_port,PCTY,428,132.15
 1/29/2026,US_live_port,DAL,2560,66.54
 1/29/2026,US_live_port,RTX,1958,199.88
@@ -974,7 +969,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,PRIM,82,152.47
 1/29/2026,US_live_port,HRL,7841,24.44
 1/29/2026,US_live_port,INVA,212,19.75
-1/29/2026,US_live_port,MPW,1343,#N/A N/A
 1/29/2026,US_live_port,VCTR,-1394,69.76
 1/29/2026,US_live_port,MITK,341,10.05
 1/29/2026,US_live_port,CB,1216,306.17
@@ -1012,7 +1006,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,PGNY,509,24.12
 1/29/2026,US_live_port,ALDX,11591,5.32
 1/29/2026,US_live_port,FCX,-2738,65.13
-1/29/2026,US_live_port,IAC,82,#N/A N/A
 1/29/2026,US_live_port,CRGY,6639,9.58
 1/29/2026,US_live_port,CSR,30,64.34
 1/29/2026,US_live_port,WAL,-1823,90.21
@@ -1042,7 +1035,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,HCC,17,92.09
 1/29/2026,US_live_port,KMT,1035,34.81
 1/29/2026,US_live_port,TPR,521,127.33
-1/29/2026,US_live_port,ATGE,604,#N/A N/A
 1/29/2026,US_live_port,DASH,-212,207.68
 1/29/2026,US_live_port,NI,-9511,44.65
 1/29/2026,US_live_port,DVA,-2190,107.24
@@ -1078,7 +1070,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,LIN,-209,455
 1/29/2026,US_live_port,COHR,3,215.86
 1/29/2026,US_live_port,FCN,-1557,174.6
-1/29/2026,US_live_port,NVRI,-5993,#N/A N/A
 1/29/2026,US_live_port,GEHC,-57,78.78
 1/29/2026,US_live_port,GME,-9071,22.81
 1/29/2026,US_live_port,ITRI,-148,100.19
@@ -1266,7 +1257,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,SMPL,8409,18.75
 1/29/2026,US_live_port,QDEL,-6442,27.41
 1/29/2026,US_live_port,CTS,-370,51.98
-1/29/2026,US_live_port,FDP,-122,#N/A N/A
 1/29/2026,US_live_port,AES,14718,15.04
 1/29/2026,US_live_port,GO,-1422,9.44
 1/29/2026,US_live_port,ESAB,-2093,119.78
@@ -1322,7 +1312,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,NSSC,931,38.3
 1/29/2026,US_live_port,NU,9338,18.76
 1/29/2026,US_live_port,TECX,-2710,20.69
-1/29/2026,US_live_port,LC,806,#N/A N/A
 1/29/2026,US_live_port,ATO,2036,166
 1/29/2026,US_live_port,CUBE,-6455,37.61
 1/29/2026,US_live_port,GKOS,-982,119.07
@@ -1652,7 +1641,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,CVLG,-5569,25.85
 1/29/2026,US_live_port,FBP,12620,22.14
 1/29/2026,US_live_port,CMI,719,583.94
-1/29/2026,US_live_port,SCVL,-38,#N/A N/A
 1/29/2026,US_live_port,SWBI,-2074,10.94
 1/29/2026,US_live_port,AGCO,-1791,114.33
 1/29/2026,US_live_port,MKSI,476,243.88
@@ -1789,7 +1777,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,NFE,-53474,1.34
 1/29/2026,US_live_port,BHB,7279,33.71
 1/29/2026,US_live_port,CDRE,-47,40.14
-1/29/2026,US_live_port,GMRE,852,#N/A N/A
 1/29/2026,US_live_port,DOCN,-265,56.13
 1/29/2026,US_live_port,DOMO,-68,6.01
 1/29/2026,US_live_port,MSBI,324,22.8
@@ -1860,7 +1847,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,UNM,4597,76.29
 1/29/2026,US_live_port,FOXF,8358,18.49
 1/29/2026,US_live_port,BW,2035,10.39
-1/29/2026,US_live_port,EXPI,-119,#N/A N/A
 1/29/2026,US_live_port,EPAM,-90,208.92
 1/29/2026,US_live_port,DEA,-1851,23.13
 1/29/2026,US_live_port,PWR,-868,483.43
@@ -1904,7 +1890,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,ITRN,263,45.38
 1/29/2026,US_live_port,HQY,-1860,83.57
 1/29/2026,US_live_port,UWMC,-454,5.7
-1/29/2026,US_live_port,AXL,-2461,#N/A N/A
 1/29/2026,US_live_port,IBKR,-855,75.66
 1/29/2026,US_live_port,ETR,-699,96.03
 1/29/2026,US_live_port,NWBI,-9081,12.79
@@ -1946,7 +1931,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,MANH,-2180,155.77
 1/29/2026,US_live_port,BF/B,-479,26.9
 1/29/2026,US_live_port,FOXA,2673,71.84
-1/29/2026,US_live_port,NINE,-62564,#N/A N/A
 1/29/2026,US_live_port,CBOE,-1067,265.52
 1/29/2026,US_live_port,FN,-78,496.26
 1/29/2026,US_live_port,MCHB,-86,15.17
@@ -1968,7 +1952,6 @@ Date,Port,ticker,shares,price
 1/29/2026,US_live_port,SLG,7293,44.54
 1/29/2026,US_live_port,IDT,449,48.12
 1/29/2026,US_live_port,FTNT,-2722,81.51
-1/29/2026,US_live_port,RYI,2176,#N/A N/A
 1/29/2026,US_live_port,LADR,100,11.16
 1/29/2026,US_live_port,GDDY,-1952,99.24
 1/29/2026,US_live_port,GRPN,-3269,14.76

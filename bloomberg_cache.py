@@ -1,0 +1,954 @@
+"""Retrieve Bloomberg data and cache it in a local SQLite database."""
+
+from __future__ import annotations
+
+import importlib
+import math
+import sqlite3
+import time
+import warnings
+from contextlib import closing, contextmanager
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any, Iterator
+
+import pandas as pd
+
+
+DEFAULT_BATCH_SIZE = 50
+DEFAULT_MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 1.0
+BLOOMBERG_HOST = "localhost"
+BLOOMBERG_PORT = 8194
+BLOOMBERG_SERVICE = "//blp/refdata"
+RESPONSE_TIMEOUT_MILLISECONDS = 120_000
+BLOOMBERG_DATABASE = (
+    Path(__file__).resolve().parent / "port_data" / "bloomberg_data.db"
+)
+PRICE_DATABASE = BLOOMBERG_DATABASE
+
+PRICE_FIELDS = [
+    "PX_LAST",
+    "TOT_RETURN_INDEX_GROSS_DVDS",
+    "PX_VOLUME",
+]
+MARKET_CAP_FIELD = "CUR_MKT_CAP"
+MARKET_CAP_MULTIPLIER = 1_000_000.0
+METADATA_FIELDS = ["GICS_SECTOR_NAME", "PX_TO_BOOK_RATIO"]
+KNOWN_SECURITY_TYPES = {
+    "Comdty",
+    "Corp",
+    "Curncy",
+    "Equity",
+    "Govt",
+    "Index",
+    "M-Mkt",
+    "Mtge",
+    "Muni",
+    "Pfd",
+}
+
+
+def _load_blpapi() -> Any:
+    """Import Bloomberg's Python package or raise an actionable error."""
+    try:
+        return importlib.import_module("blpapi")
+    except ImportError as error:
+        raise RuntimeError(
+            "Bloomberg's blpapi package is required. Install it from the "
+            "Bloomberg package index and run with Bloomberg Terminal open."
+        ) from error
+
+
+def _bloomberg_security(ticker: str) -> str:
+    """Translate a portfolio ticker into a Bloomberg security identifier."""
+    normalized = str(ticker).strip()
+    if not normalized:
+        raise ValueError("Ticker values cannot be blank.")
+
+    final_token = normalized.rsplit(maxsplit=1)[-1]
+    if final_token in KNOWN_SECURITY_TYPES:
+        return normalized
+
+    return f"{normalized} US Equity"
+
+
+def _normalize_payload(value: Any) -> list[Any]:
+    """Return one Bloomberg response element as a list."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _as_float(value: Any) -> float:
+    """Convert a Bloomberg value to a finite float or NaN."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return math.nan
+
+    return numeric if math.isfinite(numeric) else math.nan
+
+
+@contextmanager
+def _reference_data_session() -> Iterator[tuple[Any, Any, Any]]:
+    """Yield a running Bloomberg Desktop API reference-data session."""
+    blpapi = _load_blpapi()
+    options = blpapi.SessionOptions()
+    options.setServerHost(BLOOMBERG_HOST)
+    options.setServerPort(BLOOMBERG_PORT)
+    options.setClientMode(blpapi.SessionOptions.DAPI)
+    options.setNumStartAttempts(1)
+    session = blpapi.Session(options)
+
+    if not session.start():
+        raise RuntimeError(
+            "Could not start a Bloomberg Desktop API session. Confirm that "
+            "Bloomberg Terminal is open and logged in."
+        )
+
+    try:
+        if not session.openService(BLOOMBERG_SERVICE):
+            raise RuntimeError(
+                f"Could not open Bloomberg service {BLOOMBERG_SERVICE}."
+            )
+        yield blpapi, session, session.getService(BLOOMBERG_SERVICE)
+    finally:
+        session.stop()
+
+
+def _send_request(
+    blpapi: Any,
+    session: Any,
+    request: Any,
+) -> list[dict[str, Any]]:
+    """Send a synchronous Bloomberg request and decode its messages."""
+    session.sendRequest(request)
+    payloads: list[dict[str, Any]] = []
+
+    while True:
+        event = session.nextEvent(RESPONSE_TIMEOUT_MILLISECONDS)
+        event_type = event.eventType()
+        if event_type == blpapi.Event.TIMEOUT:
+            raise TimeoutError("Bloomberg request timed out.")
+
+        for message in event:
+            payload = message.toPy()
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("responseError"):
+                raise RuntimeError(
+                    f"Bloomberg response error: {payload['responseError']}"
+                )
+            payloads.append(payload)
+
+        if event_type == blpapi.Event.RESPONSE:
+            return payloads
+
+
+def _historical_data_request(
+    tickers: list[str],
+    fields: list[str],
+    start_date: date,
+    end_date: date,
+) -> list[dict[str, Any]]:
+    """Request daily historical Bloomberg fields for a ticker batch."""
+    securities = {
+        _bloomberg_security(ticker): ticker
+        for ticker in tickers
+    }
+
+    with _reference_data_session() as (blpapi, session, service):
+        request = service.createRequest("HistoricalDataRequest")
+        for security in securities:
+            request.append("securities", security)
+        for field in fields:
+            request.append("fields", field)
+        request.set("startDate", start_date.strftime("%Y%m%d"))
+        request.set("endDate", end_date.strftime("%Y%m%d"))
+        request.set("periodicitySelection", "DAILY")
+        request.set("maxDataPoints", 100_000)
+        payloads = _send_request(blpapi, session, request)
+
+    records: list[dict[str, Any]] = []
+    for payload in payloads:
+        for security_data in _normalize_payload(
+            payload.get("securityData")
+        ):
+            if not isinstance(security_data, dict):
+                continue
+            security = str(security_data.get("security", ""))
+            ticker = securities.get(security)
+            if ticker is None or security_data.get("securityError"):
+                continue
+
+            for field_data in _normalize_payload(
+                security_data.get("fieldData")
+            ):
+                if not isinstance(field_data, dict):
+                    continue
+                record = {"ticker": ticker}
+                record.update(field_data)
+                records.append(record)
+
+    return records
+
+
+def _reference_data_request(
+    tickers: list[str],
+    fields: list[str],
+) -> list[dict[str, Any]]:
+    """Request Bloomberg reference fields for a ticker batch."""
+    securities = {
+        _bloomberg_security(ticker): ticker
+        for ticker in tickers
+    }
+
+    with _reference_data_session() as (blpapi, session, service):
+        request = service.createRequest("ReferenceDataRequest")
+        for security in securities:
+            request.append("securities", security)
+        for field in fields:
+            request.append("fields", field)
+        payloads = _send_request(blpapi, session, request)
+
+    records: list[dict[str, Any]] = []
+    for payload in payloads:
+        for security_data in _normalize_payload(
+            payload.get("securityData")
+        ):
+            if not isinstance(security_data, dict):
+                continue
+            security = str(security_data.get("security", ""))
+            ticker = securities.get(security)
+            field_data = security_data.get("fieldData", {})
+            if (
+                ticker is None
+                or security_data.get("securityError")
+                or not isinstance(field_data, dict)
+            ):
+                continue
+            record = {"ticker": ticker}
+            record.update(field_data)
+            records.append(record)
+
+    return records
+
+
+def initialize_price_database(
+    database: str | Path = PRICE_DATABASE,
+) -> Path:
+    """Create Bloomberg cache tables when they do not exist."""
+    database_path = Path(database)
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_prices (
+                ticker TEXT NOT NULL,
+                date TEXT NOT NULL,
+                close REAL,
+                total_return_index REAL,
+                volume REAL,
+                retrieved_at TEXT NOT NULL,
+                PRIMARY KEY (ticker, date)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_daily_prices_date
+            ON daily_prices (date)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS historical_market_caps (
+                ticker TEXT NOT NULL,
+                as_of_date TEXT NOT NULL,
+                market_cap REAL NOT NULL,
+                retrieved_at TEXT NOT NULL,
+                PRIMARY KEY (ticker, as_of_date)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_market_caps_as_of_date
+            ON historical_market_caps (as_of_date)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS security_metadata (
+                ticker TEXT PRIMARY KEY,
+                sector TEXT,
+                price_to_book REAL,
+                retrieved_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.commit()
+
+    return database_path
+
+
+def _download_price_batch(
+    tickers: list[str],
+    start_date: date,
+    end_date: date,
+    max_retries: int,
+) -> pd.DataFrame:
+    """Download one Bloomberg historical-price batch."""
+    records: list[dict[str, Any]] = []
+
+    for attempt in range(max_retries + 1):
+        try:
+            records = _historical_data_request(
+                tickers=tickers,
+                fields=PRICE_FIELDS,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            break
+        except (RuntimeError, TimeoutError):
+            if attempt == max_retries:
+                raise
+            time.sleep(RETRY_BACKOFF_SECONDS * (2**attempt))
+
+    history_records: list[dict[str, Any]] = []
+    for record in records:
+        close = _as_float(record.get("PX_LAST"))
+        if math.isnan(close) or "date" not in record:
+            continue
+        total_return_index = _as_float(
+            record.get("TOT_RETURN_INDEX_GROSS_DVDS")
+        )
+        history_records.append(
+            {
+                "date": pd.Timestamp(record["date"]).tz_localize(None),
+                "ticker": record["ticker"],
+                "close": close,
+                "total_return_index": (
+                    close
+                    if math.isnan(total_return_index)
+                    else total_return_index
+                ),
+                "volume": _as_float(record.get("PX_VOLUME")),
+            }
+        )
+
+    return pd.DataFrame.from_records(
+        history_records,
+        columns=[
+            "date",
+            "ticker",
+            "close",
+            "total_return_index",
+            "volume",
+        ],
+    )
+
+
+def _upsert_price_history(
+    history: pd.DataFrame,
+    database: str | Path = PRICE_DATABASE,
+) -> None:
+    """Insert or update Bloomberg price observations."""
+    if history.empty:
+        return
+
+    retrieved_at = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+    rows = [
+        (
+            str(row.ticker),
+            pd.Timestamp(row.date).date().isoformat(),
+            None if pd.isna(row.close) else float(row.close),
+            (
+                None
+                if pd.isna(row.total_return_index)
+                else float(row.total_return_index)
+            ),
+            None if pd.isna(row.volume) else float(row.volume),
+            retrieved_at,
+        )
+        for row in history.itertuples(index=False)
+    ]
+
+    database_path = initialize_price_database(database)
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executemany(
+            """
+            INSERT INTO daily_prices (
+                ticker,
+                date,
+                close,
+                total_return_index,
+                volume,
+                retrieved_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (ticker, date) DO UPDATE SET
+                close = excluded.close,
+                total_return_index = excluded.total_return_index,
+                volume = excluded.volume,
+                retrieved_at = excluded.retrieved_at
+            """,
+            rows,
+        )
+        connection.commit()
+
+
+def _cached_date_bounds(
+    tickers: pd.Index,
+    database: str | Path = PRICE_DATABASE,
+) -> dict[str, tuple[date, date]]:
+    """Return cached minimum and maximum dates by ticker."""
+    database_path = initialize_price_database(database)
+    bounds: dict[str, tuple[date, date]] = {}
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        ticker_list = tickers.astype(str).unique().tolist()
+        for start in range(0, len(ticker_list), 900):
+            batch = ticker_list[start : start + 900]
+            placeholders = ", ".join("?" for _ in batch)
+            rows = connection.execute(
+                f"""
+                SELECT ticker, MIN(date), MAX(date)
+                FROM daily_prices
+                WHERE ticker IN ({placeholders})
+                GROUP BY ticker
+                """,
+                batch,
+            ).fetchall()
+            for ticker, minimum_date, maximum_date in rows:
+                bounds[ticker] = (
+                    date.fromisoformat(minimum_date),
+                    date.fromisoformat(maximum_date),
+                )
+
+    return bounds
+
+
+def ensure_price_history(
+    tickers: pd.Index,
+    start_date: date,
+    end_date: date,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    database: str | Path = PRICE_DATABASE,
+) -> None:
+    """Download only leading or trailing ranges absent from SQLite."""
+    if start_date > end_date:
+        raise ValueError("start_date cannot be after end_date.")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    if max_retries < 0:
+        raise ValueError("max_retries cannot be negative.")
+
+    unique_tickers = pd.Index(
+        tickers.astype(str).unique(),
+        name="ticker",
+    )
+    cached_bounds = _cached_date_bounds(unique_tickers, database)
+    requests_by_range: dict[tuple[date, date], list[str]] = {}
+
+    for ticker in unique_tickers:
+        bounds = cached_bounds.get(ticker)
+        if bounds is None:
+            requests_by_range.setdefault(
+                (start_date, end_date),
+                [],
+            ).append(ticker)
+            continue
+
+        minimum_date, maximum_date = bounds
+        if start_date < minimum_date:
+            leading_end = min(
+                end_date,
+                minimum_date - timedelta(days=1),
+            )
+            requests_by_range.setdefault(
+                (start_date, leading_end),
+                [],
+            ).append(ticker)
+        if end_date > maximum_date:
+            trailing_start = max(
+                start_date,
+                maximum_date + timedelta(days=1),
+            )
+            requests_by_range.setdefault(
+                (trailing_start, end_date),
+                [],
+            ).append(ticker)
+
+    for (request_start, request_end), request_tickers in sorted(
+        requests_by_range.items()
+    ):
+        for start in range(0, len(request_tickers), batch_size):
+            batch = request_tickers[start : start + batch_size]
+            history = _download_price_batch(
+                tickers=batch,
+                start_date=request_start,
+                end_date=request_end,
+                max_retries=max_retries,
+            )
+            _upsert_price_history(history, database)
+
+
+def get_price_history(
+    tickers: pd.Index,
+    start_date: date,
+    end_date: date,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    database: str | Path = PRICE_DATABASE,
+    allow_download: bool = True,
+) -> pd.DataFrame:
+    """Return an inclusive price range from the Bloomberg SQLite cache."""
+    unique_tickers = pd.Index(
+        tickers.astype(str).unique(),
+        name="ticker",
+    )
+    if allow_download:
+        ensure_price_history(
+            tickers=unique_tickers,
+            start_date=start_date,
+            end_date=end_date,
+            batch_size=batch_size,
+            max_retries=max_retries,
+            database=database,
+        )
+
+    database_path = initialize_price_database(database)
+    frames: list[pd.DataFrame] = []
+    with closing(sqlite3.connect(database_path)) as connection:
+        ticker_list = unique_tickers.tolist()
+        for start in range(0, len(ticker_list), 900):
+            batch = ticker_list[start : start + 900]
+            placeholders = ", ".join("?" for _ in batch)
+            frames.append(
+                pd.read_sql_query(
+                    f"""
+                    SELECT
+                        date,
+                        ticker,
+                        close,
+                        total_return_index,
+                        volume
+                    FROM daily_prices
+                    WHERE ticker IN ({placeholders})
+                        AND date BETWEEN ? AND ?
+                    ORDER BY date, ticker
+                    """,
+                    connection,
+                    params=[
+                        *batch,
+                        start_date.isoformat(),
+                        end_date.isoformat(),
+                    ],
+                    parse_dates=["date"],
+                )
+            )
+
+    if not frames:
+        return pd.DataFrame(
+            columns=[
+                "date",
+                "ticker",
+                "close",
+                "total_return_index",
+                "volume",
+            ]
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
+def get_prices_for_date(
+    tickers: pd.Index,
+    as_of_date: date,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    database: str | Path = PRICE_DATABASE,
+    allow_download: bool = True,
+) -> pd.Series:
+    """Return Bloomberg closing prices for one portfolio date."""
+    unique_tickers = pd.Index(
+        tickers.astype(str).unique(),
+        name="ticker",
+    )
+    history = get_price_history(
+        tickers=unique_tickers,
+        start_date=as_of_date,
+        end_date=as_of_date,
+        batch_size=batch_size,
+        max_retries=max_retries,
+        database=database,
+        allow_download=allow_download,
+    )
+    prices = history.drop_duplicates("ticker", keep="last").set_index(
+        "ticker"
+    )["close"]
+    prices = prices.reindex(unique_tickers).rename("price")
+    missing_tickers = prices.index[prices.isna()]
+
+    if len(missing_tickers) > 0:
+        preview = ", ".join(missing_tickers[:10])
+        if len(missing_tickers) > 10:
+            preview = f"{preview}, ..."
+        warnings.warn(
+            "SQLite contains no Bloomberg closing price for "
+            f"{len(missing_tickers)} ticker(s) on {as_of_date}: {preview}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    return prices
+
+
+def load_historical_market_caps(
+    tickers: pd.Index,
+    as_of_date: date,
+    database: str | Path = BLOOMBERG_DATABASE,
+) -> pd.Series:
+    """Return cached Bloomberg market caps for one historical date."""
+    unique_tickers = pd.Index(
+        tickers.astype(str).unique(),
+        name="ticker",
+    )
+    database_path = initialize_price_database(database)
+    frames: list[pd.DataFrame] = []
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        ticker_list = unique_tickers.tolist()
+        for start in range(0, len(ticker_list), 900):
+            batch = ticker_list[start : start + 900]
+            placeholders = ", ".join("?" for _ in batch)
+            frames.append(
+                pd.read_sql_query(
+                    f"""
+                    SELECT ticker, market_cap
+                    FROM historical_market_caps
+                    WHERE ticker IN ({placeholders})
+                        AND as_of_date = ?
+                    """,
+                    connection,
+                    params=[*batch, as_of_date.isoformat()],
+                )
+            )
+
+    if not frames:
+        return pd.Series(
+            index=unique_tickers,
+            dtype="float64",
+            name="market_cap",
+        )
+    cached = pd.concat(frames, ignore_index=True)
+    market_caps = cached.drop_duplicates(
+        "ticker",
+        keep="last",
+    ).set_index("ticker")["market_cap"]
+    return pd.to_numeric(
+        market_caps.reindex(unique_tickers),
+        errors="coerce",
+    ).rename("market_cap")
+
+
+def upsert_historical_market_caps(
+    market_caps: pd.Series,
+    as_of_date: date,
+    database: str | Path = BLOOMBERG_DATABASE,
+) -> None:
+    """Store successful Bloomberg market-cap observations."""
+    successful = pd.to_numeric(market_caps, errors="coerce").dropna()
+    successful = successful.loc[successful.gt(0)]
+    if successful.empty:
+        return
+
+    retrieved_at = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+    rows = [
+        (
+            str(ticker),
+            as_of_date.isoformat(),
+            float(market_cap),
+            retrieved_at,
+        )
+        for ticker, market_cap in successful.items()
+    ]
+    database_path = initialize_price_database(database)
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executemany(
+            """
+            INSERT INTO historical_market_caps (
+                ticker,
+                as_of_date,
+                market_cap,
+                retrieved_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (ticker, as_of_date) DO UPDATE SET
+                market_cap = excluded.market_cap,
+                retrieved_at = excluded.retrieved_at
+            """,
+            rows,
+        )
+        connection.commit()
+
+
+def _download_market_cap_batch(
+    tickers: list[str],
+    as_of_date: date,
+    max_retries: int,
+) -> pd.Series:
+    """Download historical Bloomberg market caps in absolute dollars."""
+    records: list[dict[str, Any]] = []
+    for attempt in range(max_retries + 1):
+        try:
+            records = _historical_data_request(
+                tickers=tickers,
+                fields=[MARKET_CAP_FIELD],
+                start_date=as_of_date,
+                end_date=as_of_date,
+            )
+            break
+        except (RuntimeError, TimeoutError):
+            if attempt == max_retries:
+                raise
+            time.sleep(RETRY_BACKOFF_SECONDS * (2**attempt))
+
+    market_caps = pd.Series(
+        index=pd.Index(tickers, name="ticker"),
+        dtype="float64",
+        name="market_cap",
+    )
+    for record in records:
+        value_in_millions = _as_float(record.get(MARKET_CAP_FIELD))
+        if not math.isnan(value_in_millions) and value_in_millions > 0:
+            market_caps.loc[record["ticker"]] = (
+                value_in_millions * MARKET_CAP_MULTIPLIER
+            )
+    return market_caps
+
+
+def get_historical_market_caps(
+    tickers: pd.Index,
+    as_of_date: date,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    database: str | Path = BLOOMBERG_DATABASE,
+    allow_download: bool = True,
+) -> pd.Series:
+    """Return cached or downloaded historical Bloomberg market caps."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    if max_retries < 0:
+        raise ValueError("max_retries cannot be negative.")
+
+    unique_tickers = pd.Index(
+        tickers.astype(str).unique(),
+        name="ticker",
+    )
+    market_caps = load_historical_market_caps(
+        tickers=unique_tickers,
+        as_of_date=as_of_date,
+        database=database,
+    )
+    missing_tickers = market_caps.index[market_caps.isna()]
+    if allow_download:
+        for start in range(0, len(missing_tickers), batch_size):
+            batch = missing_tickers[start : start + batch_size].tolist()
+            downloaded = _download_market_cap_batch(
+                tickers=batch,
+                as_of_date=as_of_date,
+                max_retries=max_retries,
+            )
+            market_caps.update(downloaded)
+            upsert_historical_market_caps(
+                market_caps=downloaded,
+                as_of_date=as_of_date,
+                database=database,
+            )
+
+    missing_tickers = market_caps.index[market_caps.isna()]
+    if len(missing_tickers) == len(market_caps):
+        raise RuntimeError(
+            "Bloomberg did not return historical market caps for any ticker."
+        )
+    if len(missing_tickers) > 0:
+        preview = ", ".join(missing_tickers[:10])
+        if len(missing_tickers) > 10:
+            preview = f"{preview}, ..."
+        warnings.warn(
+            "Bloomberg did not return historical market caps for "
+            f"{len(missing_tickers)} ticker(s): {preview}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return market_caps
+
+
+def load_security_metadata(
+    tickers: pd.Index,
+    database: str | Path = BLOOMBERG_DATABASE,
+) -> pd.DataFrame:
+    """Return cached Bloomberg sector and price-to-book metadata."""
+    unique_tickers = pd.Index(
+        tickers.astype(str).unique(),
+        name="ticker",
+    )
+    database_path = initialize_price_database(database)
+    frames: list[pd.DataFrame] = []
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        ticker_list = unique_tickers.tolist()
+        for start in range(0, len(ticker_list), 900):
+            batch = ticker_list[start : start + 900]
+            placeholders = ", ".join("?" for _ in batch)
+            frames.append(
+                pd.read_sql_query(
+                    f"""
+                    SELECT ticker, sector, price_to_book, retrieved_at
+                    FROM security_metadata
+                    WHERE ticker IN ({placeholders})
+                    """,
+                    connection,
+                    params=batch,
+                )
+            )
+
+    if not frames:
+        return pd.DataFrame(
+            index=unique_tickers,
+            columns=["sector", "price_to_book", "retrieved_at"],
+        )
+    metadata = pd.concat(frames, ignore_index=True)
+    metadata = metadata.drop_duplicates(
+        "ticker",
+        keep="last",
+    ).set_index("ticker")
+    return metadata.reindex(unique_tickers)
+
+
+def upsert_security_metadata(
+    metadata: pd.DataFrame,
+    database: str | Path = BLOOMBERG_DATABASE,
+) -> None:
+    """Store successful Bloomberg security metadata."""
+    if metadata.empty:
+        return
+
+    frame = metadata.copy()
+    if "ticker" not in frame.columns:
+        frame = frame.reset_index()
+        frame = frame.rename(columns={frame.columns[0]: "ticker"})
+    retrieved_at = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+    rows = [
+        (
+            str(row.ticker),
+            None if pd.isna(row.sector) else str(row.sector),
+            (
+                None
+                if pd.isna(row.price_to_book)
+                else float(row.price_to_book)
+            ),
+            retrieved_at,
+        )
+        for row in frame.itertuples(index=False)
+    ]
+    database_path = initialize_price_database(database)
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executemany(
+            """
+            INSERT INTO security_metadata (
+                ticker,
+                sector,
+                price_to_book,
+                retrieved_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (ticker) DO UPDATE SET
+                sector = excluded.sector,
+                price_to_book = excluded.price_to_book,
+                retrieved_at = excluded.retrieved_at
+            """,
+            rows,
+        )
+        connection.commit()
+
+
+def _download_metadata_batch(
+    tickers: list[str],
+    max_retries: int,
+) -> pd.DataFrame:
+    """Download Bloomberg GICS sector and price-to-book metadata."""
+    records: list[dict[str, Any]] = []
+    for attempt in range(max_retries + 1):
+        try:
+            records = _reference_data_request(
+                tickers=tickers,
+                fields=METADATA_FIELDS,
+            )
+            break
+        except (RuntimeError, TimeoutError):
+            if attempt == max_retries:
+                raise
+            time.sleep(RETRY_BACKOFF_SECONDS * (2**attempt))
+
+    retrieved_at = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+    metadata_records = [
+        {
+            "ticker": record["ticker"],
+            "sector": record.get("GICS_SECTOR_NAME"),
+            "price_to_book": _as_float(record.get("PX_TO_BOOK_RATIO")),
+            "retrieved_at": retrieved_at,
+        }
+        for record in records
+    ]
+    return pd.DataFrame.from_records(
+        metadata_records,
+        columns=["ticker", "sector", "price_to_book", "retrieved_at"],
+    )
+
+
+def get_security_metadata(
+    tickers: pd.Index,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    database: str | Path = BLOOMBERG_DATABASE,
+    allow_download: bool = True,
+) -> pd.DataFrame:
+    """Return cached or downloaded Bloomberg security metadata."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    if max_retries < 0:
+        raise ValueError("max_retries cannot be negative.")
+
+    unique_tickers = pd.Index(
+        tickers.astype(str).unique(),
+        name="ticker",
+    )
+    metadata = load_security_metadata(unique_tickers, database)
+    cached = metadata[["sector", "price_to_book"]].notna().all(axis=1)
+    missing_tickers = metadata.index[~cached]
+
+    if allow_download:
+        for start in range(0, len(missing_tickers), batch_size):
+            batch = missing_tickers[start : start + batch_size].tolist()
+            downloaded = _download_metadata_batch(
+                tickers=batch,
+                max_retries=max_retries,
+            )
+            upsert_security_metadata(downloaded, database)
+
+    return load_security_metadata(unique_tickers, database)
