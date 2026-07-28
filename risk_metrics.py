@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import time
-import warnings
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -13,19 +11,17 @@ from statistics import NormalDist
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
+from bloomberg_cache import (
+    PRICE_DATABASE,
+    get_price_history,
+    get_security_metadata,
+)
 from construct_port import (
     PORTFOLIO_DATA_DIR,
     load_prices,
     load_shares,
     resolve_portfolio_path,
-)
-from price_cache import (
-    PRICE_DATABASE,
-    get_price_history,
-    load_security_metadata,
-    upsert_security_metadata,
 )
 
 
@@ -36,7 +32,6 @@ DEFAULT_BATCH_SIZE = 50
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_VAR_CONFIDENCE = 0.95
 DEFAULT_BENCHMARK = "SPY"
-RETRY_BACKOFF_SECONDS = 1.0
 HISTORY_CALENDAR_MULTIPLIER = 2.25
 
 
@@ -68,11 +63,6 @@ def _portfolio_date(csv_file: str | Path) -> date:
     portfolio_path = resolve_portfolio_path(csv_file)
     date_text = portfolio_path.stem.removeprefix("US_live_port_")
     return datetime.strptime(date_text, "%Y%m%d").date()
-
-
-def _yahoo_symbol(ticker: str) -> str:
-    """Translate common share-class notation to Yahoo's symbol format."""
-    return ticker.replace(".", "-").replace("/", "-").upper()
 
 
 def calculate_position_exposures(
@@ -120,7 +110,7 @@ def download_market_history(
     database: str | Path = PRICE_DATABASE,
     allow_download: bool = True,
 ) -> pd.DataFrame:
-    """Return adjusted closes and volumes from the SQLite price cache."""
+    """Return Bloomberg closes, total-return levels, and volumes."""
     if lookback_days <= 1:
         raise ValueError("lookback_days must be greater than one.")
 
@@ -141,62 +131,9 @@ def download_market_history(
         database=database,
         allow_download=allow_download,
     )
-    history = history.drop(columns="close").rename(
-        columns={"adjusted_close": "close"}
-    )
-    return history[["date", "ticker", "close", "volume"]]
-
-
-def _download_metadata_batch(
-    tickers: list[str],
-    max_retries: int,
-) -> pd.DataFrame:
-    """Download sectors and valuation metadata sequentially."""
-    pending = list(tickers)
-    records: list[dict[str, object]] = []
-
-    for attempt in range(max_retries + 1):
-        yahoo_symbols = {
-            ticker: _yahoo_symbol(ticker)
-            for ticker in pending
-        }
-        ticker_group = yf.Tickers(" ".join(yahoo_symbols.values()))
-        failed: list[str] = []
-
-        for ticker in pending:
-            yahoo_symbol = yahoo_symbols[ticker]
-            try:
-                info = ticker_group.tickers[yahoo_symbol].get_info()
-            except Exception:
-                info = {}
-
-            sector = info.get("sector")
-            price_to_book = info.get("priceToBook")
-            if sector is None and price_to_book is None:
-                failed.append(ticker)
-                continue
-
-            records.append(
-                {
-                    "ticker": ticker,
-                    "sector": sector or "Unclassified",
-                    "price_to_book": price_to_book,
-                    "retrieved_at": datetime.now()
-                    .astimezone()
-                    .isoformat(timespec="seconds"),
-                }
-            )
-
-        pending = failed
-        if not pending or attempt == max_retries:
-            break
-
-        time.sleep(RETRY_BACKOFF_SECONDS * (2**attempt))
-
-    return pd.DataFrame.from_records(
-        records,
-        columns=["ticker", "sector", "price_to_book", "retrieved_at"],
-    )
+    return history[
+        ["date", "ticker", "close", "total_return_index", "volume"]
+    ]
 
 
 def get_risk_metadata(
@@ -204,30 +141,15 @@ def get_risk_metadata(
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_retries: int = DEFAULT_MAX_RETRIES,
     database: str | Path = PRICE_DATABASE,
+    allow_download: bool = True,
 ) -> pd.DataFrame:
-    """Return cached or newly downloaded sector and valuation metadata."""
-    unique_tickers = pd.Index(tickers.astype(str).unique(), name="ticker")
-    metadata = load_security_metadata(
-        tickers=unique_tickers,
+    """Return Bloomberg GICS sector and price-to-book metadata."""
+    return get_security_metadata(
+        tickers=tickers,
+        batch_size=batch_size,
+        max_retries=max_retries,
         database=database,
-    )
-    cached = metadata[["sector", "price_to_book"]].notna().any(axis=1)
-    missing_tickers = metadata.index[~cached].tolist()
-
-    for start in range(0, len(missing_tickers), batch_size):
-        batch = missing_tickers[start : start + batch_size]
-        downloaded = _download_metadata_batch(
-            tickers=batch,
-            max_retries=max_retries,
-        )
-        upsert_security_metadata(
-            metadata=downloaded,
-            database=database,
-        )
-
-    return load_security_metadata(
-        tickers=unique_tickers,
-        database=database,
+        allow_download=allow_download,
     )
 
 
@@ -235,7 +157,7 @@ def calculate_sector_exposures(
     weights: pd.Series,
     sectors: pd.Series,
 ) -> pd.DataFrame:
-    """Return long, short, gross, and net weights by Yahoo sector."""
+    """Return long, short, gross, and net weights by Bloomberg GICS sector."""
     aligned_sectors = sectors.reindex(weights.index).fillna("Unclassified")
     exposure = pd.DataFrame(
         {
@@ -277,9 +199,15 @@ def calculate_factor_scores(
     volumes: pd.DataFrame,
     market_caps: pd.Series,
     price_to_book: pd.Series,
+    liquidity_prices: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Return standardized size, value, momentum, vol, and liquidity."""
     returns = close_prices.pct_change(fill_method=None)
+    dollar_volume_prices = (
+        close_prices
+        if liquidity_prices is None
+        else liquidity_prices.reindex_like(close_prices)
+    )
     momentum: dict[str, float] = {}
 
     for ticker in close_prices.columns:
@@ -297,7 +225,9 @@ def calculate_factor_scores(
     realized_volatility = returns.std().mul(
         math.sqrt(TRADING_DAYS_PER_YEAR)
     )
-    average_dollar_volume = close_prices.mul(volumes).tail(63).mean()
+    average_dollar_volume = dollar_volume_prices.mul(
+        volumes
+    ).tail(63).mean()
     raw_factors = pd.DataFrame(
         {
             "size": np.log(market_caps.where(market_caps.gt(0))),
@@ -439,20 +369,30 @@ def create_risk_report(
         columns="ticker",
         values="close",
     ).sort_index()
+    return_levels = history.pivot(
+        index="date",
+        columns="ticker",
+        values="total_return_index",
+    ).sort_index()
     volumes = history.pivot(
         index="date",
         columns="ticker",
         values="volume",
     ).sort_index()
     close_prices = close_prices.tail(lookback_days + 1)
+    return_levels = return_levels.reindex(close_prices.index).reindex(
+        columns=close_prices.columns
+    )
     volumes = volumes.reindex(close_prices.index)
 
-    if benchmark not in close_prices:
+    if benchmark not in return_levels:
         raise ValueError(
             f"Benchmark history is unavailable for {benchmark}."
         )
 
-    returns = close_prices.pct_change(fill_method=None).tail(lookback_days)
+    returns = return_levels.pct_change(
+        fill_method=None
+    ).tail(lookback_days)
     benchmark_returns = returns[benchmark]
     asset_returns = returns.drop(columns=benchmark, errors="ignore")
     betas = calculate_asset_betas(
@@ -468,16 +408,24 @@ def create_risk_report(
         tickers=weights.index,
         batch_size=batch_size,
         max_retries=max_retries,
+        allow_download=allow_price_download,
     )
     sector_exposures = calculate_sector_exposures(
         weights=weights,
         sectors=metadata["sector"],
     )
     factor_scores = calculate_factor_scores(
-        close_prices=close_prices.drop(columns=benchmark, errors="ignore"),
+        close_prices=return_levels.drop(
+            columns=benchmark,
+            errors="ignore",
+        ),
         volumes=volumes.drop(columns=benchmark, errors="ignore"),
         market_caps=market_caps,
         price_to_book=metadata["price_to_book"],
+        liquidity_prices=close_prices.drop(
+            columns=benchmark,
+            errors="ignore",
+        ),
     )
     factor_exposures, factor_coverage = calculate_factor_exposures(
         weights=weights,

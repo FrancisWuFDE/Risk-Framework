@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from price_cache import (
+from bloomberg_cache import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_MAX_RETRIES,
     PRICE_DATABASE,
@@ -112,7 +112,7 @@ def load_prices(
     database: str | Path = PRICE_DATABASE,
     allow_download: bool = True,
 ) -> pd.Series:
-    """Return dated yfinance closes from the SQLite price cache."""
+    """Return dated Bloomberg closes from the SQLite price cache."""
     portfolio = _read_portfolio_csv(csv_file)
     tickers = pd.Index(portfolio["ticker"], name="ticker")
     return get_prices_for_date(

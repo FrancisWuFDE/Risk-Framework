@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import time
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,7 +11,6 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-import yfinance as yf
 from pandas.tseries.holiday import (
     AbstractHolidayCalendar,
     GoodFriday,
@@ -35,19 +33,15 @@ from construct_port import (
     load_shares,
     resolve_portfolio_path,
 )
-from price_cache import (
-    YFINANCE_DATABASE,
+from bloomberg_cache import (
+    BLOOMBERG_DATABASE,
     ensure_price_history,
-    get_prices_for_date,
-    load_historical_market_caps,
-    upsert_historical_market_caps,
+    get_historical_market_caps,
 )
 
 
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 1.0
-SHARES_LOOKBACK_DAYS = 730
 MarketCapProvider = Callable[[pd.Index, pd.Series, date], pd.Series]
 
 
@@ -225,117 +219,28 @@ def calculate_daily_turnover(
 
 def calculate_daily_return(
     previous_shares: pd.Series,
+    today_shares: pd.Series,
     today_prices: pd.Series,
     previous_prices: pd.Series,
 ) -> float:
-    """Return prior holdings' daily P&L over prior gross capital."""
-    aligned_today_prices = today_prices.reindex(previous_shares.index)
-    aligned_previous_prices = previous_prices.reindex(
-        previous_shares.index
+    """Return the daily change in gross portfolio capital."""
+    today_capital = float(
+        today_shares.mul(today_prices).abs().sum(min_count=1)
     )
-    valid = aligned_today_prices.notna() & aligned_previous_prices.notna()
-    if not valid.any():
+    previous_capital = float(
+        previous_shares.mul(previous_prices).abs().sum(min_count=1)
+    )
+
+    if not math.isfinite(today_capital) or today_capital <= 0:
         raise ValueError(
-            "Cannot calculate daily return without overlapping prices."
+            "Cannot calculate daily return without positive current capital."
         )
-
-    priced_shares = previous_shares.loc[valid]
-    prior_market_values = priced_shares.mul(
-        aligned_previous_prices.loc[valid]
-    )
-    prior_capital = float(prior_market_values.abs().sum())
-    if not math.isfinite(prior_capital) or prior_capital <= 0:
+    if not math.isfinite(previous_capital) or previous_capital <= 0:
         raise ValueError(
-            "Cannot calculate daily return without positive prior capital."
+            "Cannot calculate daily return without positive previous capital."
         )
 
-    daily_profit_and_loss = priced_shares.mul(
-        aligned_today_prices.loc[valid].sub(
-            aligned_previous_prices.loc[valid]
-        )
-    ).sum()
-    return float(daily_profit_and_loss / prior_capital)
-
-
-def _extract_historical_shares(
-    ticker: yf.Ticker,
-    as_of_date: date,
-) -> float:
-    """Return the latest reported shares outstanding on or before a date."""
-    start_date = as_of_date - timedelta(days=SHARES_LOOKBACK_DAYS)
-    end_date = as_of_date + timedelta(days=1)
-    shares_history = ticker.get_shares_full(
-        start=start_date.isoformat(),
-        end=end_date.isoformat(),
-    )
-    if shares_history is None or shares_history.empty:
-        return math.nan
-
-    shares_history = pd.to_numeric(shares_history, errors="coerce").dropna()
-    observation_dates = pd.Index(
-        [timestamp.date() for timestamp in shares_history.index]
-    )
-    shares_history = shares_history.loc[observation_dates <= as_of_date]
-    if shares_history.empty:
-        return math.nan
-
-    shares_outstanding = float(shares_history.iloc[-1])
-    if not math.isfinite(shares_outstanding) or shares_outstanding <= 0:
-        return math.nan
-
-    return shares_outstanding
-
-
-def _fetch_market_cap_batch(
-    tickers: list[str],
-    prices: pd.Series,
-    as_of_date: date,
-    max_retries: int,
-    backoff_seconds: float,
-) -> pd.Series:
-    """Fetch historical shares and calculate one dated market-cap batch."""
-    results = pd.Series(
-        index=pd.Index(tickers, name="ticker"),
-        dtype="float64",
-        name="market_cap",
-    )
-    pending = list(tickers)
-
-    for attempt in range(max_retries + 1):
-        yahoo_symbols = {
-            ticker: ticker.replace(".", "-").replace("/", "-").upper()
-            for ticker in pending
-        }
-        ticker_group = yf.Tickers(" ".join(yahoo_symbols.values()))
-        failed: list[str] = []
-
-        for ticker in pending:
-            yahoo_symbol = yahoo_symbols[ticker]
-            price = prices.get(ticker, math.nan)
-            try:
-                shares_outstanding = _extract_historical_shares(
-                    ticker=ticker_group.tickers[yahoo_symbol],
-                    as_of_date=as_of_date,
-                )
-            except Exception:
-                shares_outstanding = math.nan
-
-            if pd.isna(price) or math.isnan(shares_outstanding):
-                failed.append(ticker)
-            else:
-                market_cap = float(price) * shares_outstanding
-                if math.isfinite(market_cap) and market_cap > 0:
-                    results.loc[ticker] = market_cap
-                else:
-                    failed.append(ticker)
-
-        pending = failed
-        if not pending or attempt == max_retries:
-            break
-
-        time.sleep(backoff_seconds * (2**attempt))
-
-    return results
+    return float(today_capital / previous_capital - 1.0)
 
 
 def get_market_caps(
@@ -344,63 +249,17 @@ def get_market_caps(
     as_of_date: date,
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_retries: int = DEFAULT_MAX_RETRIES,
-    database: str | Path = YFINANCE_DATABASE,
+    database: str | Path = BLOOMBERG_DATABASE,
 ) -> pd.Series:
-    """Return Yahoo market caps calculated for a historical portfolio date."""
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive.")
-    if max_retries < 0:
-        raise ValueError("max_retries cannot be negative.")
-
-    unique_tickers = pd.Index(tickers.astype(str).unique(), name="ticker")
-    cached_market_caps = load_historical_market_caps(
-        tickers=unique_tickers,
+    """Return Bloomberg market caps for a historical portfolio date."""
+    del prices
+    return get_historical_market_caps(
+        tickers=tickers,
         as_of_date=as_of_date,
+        batch_size=batch_size,
+        max_retries=max_retries,
         database=database,
     )
-    market_caps = cached_market_caps.reindex(unique_tickers)
-    missing_tickers = market_caps.index[market_caps.isna()]
-    aligned_prices = prices.reindex(unique_tickers)
-    downloadable_tickers = missing_tickers[
-        aligned_prices.reindex(missing_tickers).notna()
-    ]
-
-    for start in range(0, len(downloadable_tickers), batch_size):
-        batch = downloadable_tickers[start : start + batch_size].tolist()
-        downloaded = _fetch_market_cap_batch(
-            tickers=batch,
-            prices=aligned_prices,
-            as_of_date=as_of_date,
-            max_retries=max_retries,
-            backoff_seconds=RETRY_BACKOFF_SECONDS,
-        )
-        market_caps.update(downloaded)
-        upsert_historical_market_caps(
-            market_caps=downloaded,
-            as_of_date=as_of_date,
-            prices=aligned_prices,
-            database=database,
-        )
-
-    missing_tickers = market_caps.index[market_caps.isna()]
-    if len(missing_tickers) == len(market_caps):
-        raise RuntimeError(
-            "Yahoo Finance did not return historical shares data for any "
-            "ticker."
-        )
-
-    if len(missing_tickers) > 0:
-        preview = ", ".join(missing_tickers[:10])
-        if len(missing_tickers) > 10:
-            preview = f"{preview}, ..."
-        warnings.warn(
-            "Yahoo Finance did not return historical shares data for "
-            f"{len(missing_tickers)} ticker(s): {preview}",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-
-    return market_caps
 
 
 def calculate_weighted_average_market_cap(
@@ -469,14 +328,6 @@ def create_portfolio_summary(
         allow_download=allow_price_download,
     )
     as_of_date = _portfolio_date(today_path)
-    today_prices_for_prior_holdings = get_prices_for_date(
-        tickers=previous_shares.index,
-        as_of_date=as_of_date,
-        batch_size=price_batch_size,
-        max_retries=price_max_retries,
-        allow_download=allow_price_download,
-    )
-
     if today_shares.isna().any():
         raise ValueError("Today's shares cannot contain missing values.")
     if previous_shares.isna().any():
@@ -539,7 +390,8 @@ def create_portfolio_summary(
         capital=capital_used,
         daily_return=calculate_daily_return(
             previous_shares=previous_shares,
-            today_prices=today_prices_for_prior_holdings,
+            today_shares=today_shares,
+            today_prices=today_prices,
             previous_prices=previous_prices,
         ),
         daily_turnover=calculate_daily_turnover(
@@ -622,13 +474,13 @@ def main() -> None:
         "--batch-size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
-        help="Sequential Yahoo Finance batch size (default: 50).",
+        help="Sequential Bloomberg request batch size (default: 50).",
     )
     parser.add_argument(
         "--max-retries",
         type=int,
         default=DEFAULT_MAX_RETRIES,
-        help="Retries for failed Yahoo tickers (default: 3).",
+        help="Retries for failed Bloomberg requests (default: 3).",
     )
     parser.add_argument(
         "--capital",
