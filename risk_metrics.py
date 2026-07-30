@@ -279,6 +279,14 @@ def calculate_factor_scores(
     price_to_book: pd.Series,
 ) -> pd.DataFrame:
     """Return standardized size, value, momentum, vol, and liquidity."""
+    numeric_market_caps = pd.to_numeric(
+        market_caps,
+        errors="coerce",
+    ).astype("float64")
+    numeric_price_to_book = pd.to_numeric(
+        price_to_book,
+        errors="coerce",
+    ).astype("float64")
     returns = close_prices.pct_change(fill_method=None)
     momentum: dict[str, float] = {}
 
@@ -298,10 +306,18 @@ def calculate_factor_scores(
         math.sqrt(TRADING_DAYS_PER_YEAR)
     )
     average_dollar_volume = close_prices.mul(volumes).tail(63).mean()
+    average_dollar_volume = pd.to_numeric(
+        average_dollar_volume,
+        errors="coerce",
+    ).astype("float64")
     raw_factors = pd.DataFrame(
         {
-            "size": np.log(market_caps.where(market_caps.gt(0))),
-            "value": price_to_book.where(price_to_book.gt(0)).pow(-1),
+            "size": np.log(
+                numeric_market_caps.where(numeric_market_caps.gt(0))
+            ),
+            "value": numeric_price_to_book.where(
+                numeric_price_to_book.gt(0)
+            ).pow(-1),
             "momentum": pd.Series(momentum),
             "volatility": realized_volatility,
             "liquidity": np.log(
