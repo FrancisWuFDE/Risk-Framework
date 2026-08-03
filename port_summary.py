@@ -640,8 +640,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--benchmark",
-        default="SPY",
-        help="Benchmark ticker used for beta (default: SPY).",
+        default="VTHR",
+        help="Benchmark ticker used for beta (default: VTHR).",
     )
     parser.add_argument(
         "--risk-lookback-days",
