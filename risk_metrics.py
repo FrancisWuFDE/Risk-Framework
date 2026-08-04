@@ -31,7 +31,13 @@ DEFAULT_MINIMUM_OBSERVATIONS = 60
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_VAR_CONFIDENCE = 0.95
-DEFAULT_BENCHMARK = "SPY"
+DEFAULT_BENCHMARK = "VTHR"
+DEFAULT_LIQUIDITY_LOOKBACK_DAYS = 63
+DEFAULT_RELATIVE_STRENGTH_LOOKBACK_DAYS = 63
+DEFAULT_RELATIVE_STRENGTH_SKIP_DAYS = 5
+DEFAULT_SHORT_TERM_REVERSAL_MAX_LAG = 6
+DEFAULT_SHORT_TERM_REVERSAL_HALF_LIFE_DAYS = 3.0
+DEFAULT_SENTIMENT_LOOKBACK_DAYS = 20
 HISTORY_CALENDAR_MULTIPLIER = 2.25
 
 
@@ -132,7 +138,16 @@ def download_market_history(
         allow_download=allow_download,
     )
     return history[
-        ["date", "ticker", "close", "total_return_index", "volume"]
+        [
+            "date",
+            "ticker",
+            "close",
+            "total_return_index",
+            "volume",
+            "short_interest",
+            "equity_float",
+            "analyst_sentiment",
+        ]
     ]
 
 
@@ -194,49 +209,208 @@ def _zscore(values: pd.Series) -> pd.Series:
     return clipped.sub(clipped.mean()).div(standard_deviation)
 
 
+def calculate_amihud_illiquidity(
+    total_return_levels: pd.DataFrame,
+    raw_close: pd.DataFrame,
+    volumes: pd.DataFrame,
+    lookback_days: int = DEFAULT_LIQUIDITY_LOOKBACK_DAYS,
+) -> pd.Series:
+    """Return average absolute return per dollar of trading volume."""
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be positive.")
+
+    aligned_close = raw_close.reindex_like(total_return_levels)
+    aligned_volumes = volumes.reindex_like(total_return_levels)
+    returns = total_return_levels.pct_change(fill_method=None)
+    dollar_volume = aligned_close.mul(aligned_volumes)
+    dollar_volume = dollar_volume.where(dollar_volume.gt(0))
+    daily_illiquidity = returns.abs().div(dollar_volume)
+    window = daily_illiquidity.tail(lookback_days)
+    required_observations = min(lookback_days, len(window))
+    return window.mean().where(
+        window.count().eq(required_observations)
+    ).rename("liquidity")
+
+
+def calculate_relative_strength(
+    total_return_levels: pd.DataFrame,
+    benchmark_levels: pd.Series,
+    lookback_days: int = DEFAULT_RELATIVE_STRENGTH_LOOKBACK_DAYS,
+    skip_recent_days: int = DEFAULT_RELATIVE_STRENGTH_SKIP_DAYS,
+) -> pd.Series:
+    """Return stock total return relative to the benchmark over 63–5 days."""
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be positive.")
+    if skip_recent_days < 0:
+        raise ValueError("skip_recent_days cannot be negative.")
+    if skip_recent_days >= lookback_days:
+        raise ValueError(
+            "skip_recent_days must be less than lookback_days."
+        )
+
+    required_levels = lookback_days + 1
+    if len(total_return_levels) < required_levels:
+        raise ValueError(
+            f"Relative strength requires at least {required_levels} "
+            "price observations."
+        )
+
+    aligned_benchmark = benchmark_levels.reindex(
+        total_return_levels.index
+    )
+    starting_index = -required_levels
+    ending_index = -(skip_recent_days + 1)
+    benchmark_start = aligned_benchmark.iloc[starting_index]
+    benchmark_end = aligned_benchmark.iloc[ending_index]
+    if (
+        pd.isna(benchmark_start)
+        or pd.isna(benchmark_end)
+        or benchmark_start <= 0
+        or benchmark_end <= 0
+    ):
+        raise ValueError(
+            "Benchmark levels are unavailable at the relative-strength "
+            "endpoints."
+        )
+
+    stock_start = total_return_levels.iloc[starting_index]
+    stock_end = total_return_levels.iloc[ending_index]
+    stock_growth = stock_end.where(stock_end.gt(0)).div(
+        stock_start.where(stock_start.gt(0))
+    )
+    benchmark_growth = benchmark_end / benchmark_start
+    return stock_growth.div(benchmark_growth).sub(1.0).rename(
+        "relative_strength"
+    )
+
+
+def calculate_short_term_reversal(
+    total_return_levels: pd.DataFrame,
+    maximum_lag: int = DEFAULT_SHORT_TERM_REVERSAL_MAX_LAG,
+    weight_half_life_days: float = (
+        DEFAULT_SHORT_TERM_REVERSAL_HALF_LIFE_DAYS
+    ),
+) -> pd.Series:
+    """Return negative weighted returns from lags two through six."""
+    if maximum_lag < 2:
+        raise ValueError("maximum_lag must be at least 2.")
+    if weight_half_life_days <= 0:
+        raise ValueError("weight_half_life_days must be positive.")
+
+    required_levels = maximum_lag + 2
+    if len(total_return_levels) < required_levels:
+        raise ValueError(
+            f"Short-term reversal requires at least {required_levels} "
+            "price observations."
+        )
+
+    returns = total_return_levels.pct_change(fill_method=None)
+    lags = np.arange(2, maximum_lag + 1)
+    decay_factor = 0.5 ** (1.0 / weight_half_life_days)
+    weights = decay_factor ** (lags - 2)
+    weights /= weights.sum()
+    lagged_returns = pd.DataFrame(
+        {lag: returns.shift(lag).iloc[-1] for lag in lags}
+    )
+    return lagged_returns.mul(weights, axis="columns").sum(
+        axis="columns",
+        min_count=len(lags),
+    ).mul(-1.0).rename("short_term_reversal")
+
+
+def latest_historical_values(
+    values: pd.DataFrame,
+) -> pd.Series:
+    """Return each ticker's latest non-null value in the history window."""
+    return values.ffill().iloc[-1]
+
+
+def calculate_recommendation_sentiment(
+    analyst_consensus: pd.DataFrame,
+    lookback_days: int = DEFAULT_SENTIMENT_LOOKBACK_DAYS,
+) -> pd.Series:
+    """Return the change in analyst consensus over 20 trading days.
+
+    Bloomberg's EQY_REC_CONS level is carried forward between changes. A
+    positive result means the consensus recommendation improved over the
+    lookback; a negative result means analyst opinion deteriorated.
+    """
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be positive.")
+
+    required_observations = lookback_days + 1
+    if len(analyst_consensus) < required_observations:
+        raise ValueError(
+            "Recommendation sentiment requires at least "
+            f"{required_observations} observations."
+        )
+
+    numeric_consensus = analyst_consensus.apply(
+        pd.to_numeric,
+        errors="coerce",
+    ).ffill()
+    current_consensus = numeric_consensus.iloc[-1]
+    prior_consensus = numeric_consensus.iloc[-required_observations]
+    return current_consensus.sub(prior_consensus).rename("sentiment")
+
+
 def calculate_factor_scores(
     close_prices: pd.DataFrame,
     volumes: pd.DataFrame,
     market_caps: pd.Series,
     price_to_book: pd.Series,
+    benchmark_prices: pd.Series,
+    short_interest: pd.Series,
+    equity_float: pd.Series,
+    analyst_sentiment: pd.Series,
     liquidity_prices: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Return standardized size, value, momentum, vol, and liquidity."""
+    """Return standardized Bloomberg-backed style-factor scores."""
     returns = close_prices.pct_change(fill_method=None)
     dollar_volume_prices = (
         close_prices
         if liquidity_prices is None
         else liquidity_prices.reindex_like(close_prices)
     )
-    momentum: dict[str, float] = {}
-
-    for ticker in close_prices.columns:
-        prices = close_prices[ticker].dropna()
-        if len(prices) < 126:
-            momentum[ticker] = math.nan
-            continue
-
-        recent_index = -22 if len(prices) >= 22 else -1
-        old_index = -253 if len(prices) >= 253 else 0
-        momentum[ticker] = (
-            prices.iloc[recent_index] / prices.iloc[old_index] - 1
-        )
-
     realized_volatility = returns.std().mul(
         math.sqrt(TRADING_DAYS_PER_YEAR)
     )
-    average_dollar_volume = dollar_volume_prices.mul(
-        volumes
-    ).tail(63).mean()
+    relative_strength = calculate_relative_strength(
+        total_return_levels=close_prices,
+        benchmark_levels=benchmark_prices,
+    )
+    short_term_reversal = calculate_short_term_reversal(close_prices)
+    illiquidity = calculate_amihud_illiquidity(
+        total_return_levels=close_prices,
+        raw_close=dollar_volume_prices,
+        volumes=volumes,
+    )
+    numeric_short_interest = pd.to_numeric(
+        short_interest,
+        errors="coerce",
+    )
+    numeric_equity_float = pd.to_numeric(
+        equity_float,
+        errors="coerce",
+    )
+    short_percent_float = numeric_short_interest.where(
+        numeric_short_interest.ge(0)
+    ).div(numeric_equity_float.where(numeric_equity_float.gt(0)))
     raw_factors = pd.DataFrame(
         {
             "size": np.log(market_caps.where(market_caps.gt(0))),
             "value": price_to_book.where(price_to_book.gt(0)).pow(-1),
-            "momentum": pd.Series(momentum),
-            "volatility": realized_volatility,
-            "liquidity": np.log(
-                average_dollar_volume.where(average_dollar_volume.gt(0))
+            "relative_strength": relative_strength,
+            "short_term_reversal": short_term_reversal,
+            "short_interest": short_percent_float.where(
+                short_percent_float.ge(0)
             ),
+            "sentiment": pd.to_numeric(
+                analyst_sentiment,
+                errors="coerce",
+            ),
+            "volatility": realized_volatility,
+            "liquidity": illiquidity,
         }
     )
     return raw_factors.apply(_zscore)
@@ -248,7 +422,9 @@ def calculate_factor_exposures(
 ) -> tuple[pd.Series, pd.Series]:
     """Return signed portfolio factor exposures and ticker coverage."""
     aligned_scores = factor_scores.reindex(weights.index)
-    exposures = aligned_scores.mul(weights, axis="index").sum()
+    exposures = aligned_scores.mul(weights, axis="index").sum(
+        min_count=1
+    )
     exposures.name = "exposure"
     coverage = aligned_scores.notna().sum()
     coverage.name = "ticker_coverage"
@@ -379,11 +555,33 @@ def create_risk_report(
         columns="ticker",
         values="volume",
     ).sort_index()
+    short_interest_history = history.pivot(
+        index="date",
+        columns="ticker",
+        values="short_interest",
+    ).sort_index()
+    equity_float_history = history.pivot(
+        index="date",
+        columns="ticker",
+        values="equity_float",
+    ).sort_index()
+    sentiment_history = history.pivot(
+        index="date",
+        columns="ticker",
+        values="analyst_sentiment",
+    ).sort_index()
     close_prices = close_prices.tail(lookback_days + 1)
     return_levels = return_levels.reindex(close_prices.index).reindex(
         columns=close_prices.columns
     )
     volumes = volumes.reindex(close_prices.index)
+    short_interest_history = short_interest_history.reindex(
+        close_prices.index
+    )
+    equity_float_history = equity_float_history.reindex(
+        close_prices.index
+    )
+    sentiment_history = sentiment_history.reindex(close_prices.index)
 
     if benchmark not in return_levels:
         raise ValueError(
@@ -422,6 +620,16 @@ def create_risk_report(
         volumes=volumes.drop(columns=benchmark, errors="ignore"),
         market_caps=market_caps,
         price_to_book=metadata["price_to_book"],
+        benchmark_prices=return_levels[benchmark],
+        short_interest=latest_historical_values(
+            short_interest_history.drop(columns=benchmark, errors="ignore")
+        ),
+        equity_float=latest_historical_values(
+            equity_float_history.drop(columns=benchmark, errors="ignore")
+        ),
+        analyst_sentiment=calculate_recommendation_sentiment(
+            sentiment_history.drop(columns=benchmark, errors="ignore")
+        ),
         liquidity_prices=close_prices.drop(
             columns=benchmark,
             errors="ignore",

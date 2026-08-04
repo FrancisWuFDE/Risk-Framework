@@ -37,6 +37,7 @@ from bloomberg_cache import (
     BLOOMBERG_DATABASE,
     ensure_price_history,
     get_historical_market_caps,
+    get_security_metadata,
 )
 
 
@@ -492,8 +493,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--benchmark",
-        default="SPY",
-        help="Benchmark ticker used for beta (default: SPY).",
+        default="VTHR",
+        help=(
+            "Benchmark ticker used for beta and relative strength "
+            "(default: VTHR)."
+        ),
     )
     parser.add_argument(
         "--risk-lookback-days",
@@ -540,6 +544,11 @@ def main() -> None:
         tickers=price_tickers,
         start_date=price_start_date,
         end_date=as_of_date,
+        batch_size=args.batch_size,
+        max_retries=args.max_retries,
+    )
+    get_security_metadata(
+        tickers=today_shares.index,
         batch_size=args.batch_size,
         max_retries=args.max_retries,
     )

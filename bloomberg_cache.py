@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib
 import math
 import sqlite3
@@ -17,7 +18,11 @@ import pandas as pd
 
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_MAX_RETRIES = 3
+DEFAULT_CACHE_LOOKBACK_DAYS = 252
+DEFAULT_BENCHMARK = "VTHR"
+HISTORY_CALENDAR_MULTIPLIER = 2.25
 RETRY_BACKOFF_SECONDS = 1.0
+HISTORICAL_FIELDS_VERSION = 1
 BLOOMBERG_HOST = "localhost"
 BLOOMBERG_PORT = 8194
 BLOOMBERG_SERVICE = "//blp/refdata"
@@ -27,10 +32,13 @@ BLOOMBERG_DATABASE = (
 )
 PRICE_DATABASE = BLOOMBERG_DATABASE
 
-PRICE_FIELDS = [
+HISTORICAL_FIELDS = [
     "PX_LAST",
     "TOT_RETURN_INDEX_GROSS_DVDS",
     "PX_VOLUME",
+    "SHORT_INT",
+    "EQY_FLOAT",
+    "EQY_REC_CONS",
 ]
 MARKET_CAP_FIELD = "CUR_MKT_CAP"
 MARKET_CAP_MULTIPLIER = 1_000_000.0
@@ -253,11 +261,35 @@ def initialize_price_database(
                 close REAL,
                 total_return_index REAL,
                 volume REAL,
+                short_interest REAL,
+                equity_float REAL,
+                analyst_sentiment REAL,
+                historical_fields_version INTEGER NOT NULL DEFAULT 0,
                 retrieved_at TEXT NOT NULL,
                 PRIMARY KEY (ticker, date)
             )
             """
         )
+        existing_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(daily_prices)"
+            ).fetchall()
+        }
+        new_columns = {
+            "short_interest": "REAL",
+            "equity_float": "REAL",
+            "analyst_sentiment": "REAL",
+            "historical_fields_version": (
+                "INTEGER NOT NULL DEFAULT 0"
+            ),
+        }
+        for column, data_type in new_columns.items():
+            if column not in existing_columns:
+                connection.execute(
+                    f"ALTER TABLE daily_prices "
+                    f"ADD COLUMN {column} {data_type}"
+                )
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_daily_prices_date
@@ -309,7 +341,7 @@ def _download_price_batch(
         try:
             records = _historical_data_request(
                 tickers=tickers,
-                fields=PRICE_FIELDS,
+                fields=HISTORICAL_FIELDS,
                 start_date=start_date,
                 end_date=end_date,
             )
@@ -338,6 +370,14 @@ def _download_price_batch(
                     else total_return_index
                 ),
                 "volume": _as_float(record.get("PX_VOLUME")),
+                "short_interest": _as_float(
+                    record.get("SHORT_INT")
+                ),
+                "equity_float": _as_float(record.get("EQY_FLOAT")),
+                "analyst_sentiment": _as_float(
+                    record.get("EQY_REC_CONS")
+                ),
+                "historical_fields_version": HISTORICAL_FIELDS_VERSION,
             }
         )
 
@@ -349,6 +389,10 @@ def _download_price_batch(
             "close",
             "total_return_index",
             "volume",
+            "short_interest",
+            "equity_float",
+            "analyst_sentiment",
+            "historical_fields_version",
         ],
     )
 
@@ -375,6 +419,22 @@ def _upsert_price_history(
                 else float(row.total_return_index)
             ),
             None if pd.isna(row.volume) else float(row.volume),
+            (
+                None
+                if pd.isna(row.short_interest)
+                else float(row.short_interest)
+            ),
+            (
+                None
+                if pd.isna(row.equity_float)
+                else float(row.equity_float)
+            ),
+            (
+                None
+                if pd.isna(row.analyst_sentiment)
+                else float(row.analyst_sentiment)
+            ),
+            int(row.historical_fields_version),
             retrieved_at,
         )
         for row in history.itertuples(index=False)
@@ -390,13 +450,23 @@ def _upsert_price_history(
                 close,
                 total_return_index,
                 volume,
+                short_interest,
+                equity_float,
+                analyst_sentiment,
+                historical_fields_version,
                 retrieved_at
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (ticker, date) DO UPDATE SET
                 close = excluded.close,
                 total_return_index = excluded.total_return_index,
                 volume = excluded.volume,
+                short_interest = excluded.short_interest,
+                equity_float = excluded.equity_float,
+                analyst_sentiment = excluded.analyst_sentiment,
+                historical_fields_version = (
+                    excluded.historical_fields_version
+                ),
                 retrieved_at = excluded.retrieved_at
             """,
             rows,
@@ -407,10 +477,10 @@ def _upsert_price_history(
 def _cached_date_bounds(
     tickers: pd.Index,
     database: str | Path = PRICE_DATABASE,
-) -> dict[str, tuple[date, date]]:
-    """Return cached minimum and maximum dates by ticker."""
+) -> dict[str, tuple[date, date, int]]:
+    """Return cached date bounds and field version by ticker."""
     database_path = initialize_price_database(database)
-    bounds: dict[str, tuple[date, date]] = {}
+    bounds: dict[str, tuple[date, date, int]] = {}
 
     with closing(sqlite3.connect(database_path)) as connection:
         ticker_list = tickers.astype(str).unique().tolist()
@@ -419,17 +489,27 @@ def _cached_date_bounds(
             placeholders = ", ".join("?" for _ in batch)
             rows = connection.execute(
                 f"""
-                SELECT ticker, MIN(date), MAX(date)
+                SELECT
+                    ticker,
+                    MIN(date),
+                    MAX(date),
+                    MAX(historical_fields_version)
                 FROM daily_prices
                 WHERE ticker IN ({placeholders})
                 GROUP BY ticker
                 """,
                 batch,
             ).fetchall()
-            for ticker, minimum_date, maximum_date in rows:
+            for (
+                ticker,
+                minimum_date,
+                maximum_date,
+                fields_version,
+            ) in rows:
                 bounds[ticker] = (
                     date.fromisoformat(minimum_date),
                     date.fromisoformat(maximum_date),
+                    int(fields_version),
                 )
 
     return bounds
@@ -467,7 +547,13 @@ def ensure_price_history(
             ).append(ticker)
             continue
 
-        minimum_date, maximum_date = bounds
+        minimum_date, maximum_date, fields_version = bounds
+        if fields_version < HISTORICAL_FIELDS_VERSION:
+            requests_by_range.setdefault(
+                (start_date, end_date),
+                [],
+            ).append(ticker)
+            continue
         if start_date < minimum_date:
             leading_end = min(
                 end_date,
@@ -540,7 +626,10 @@ def get_price_history(
                         ticker,
                         close,
                         total_return_index,
-                        volume
+                        volume,
+                        short_interest,
+                        equity_float,
+                        analyst_sentiment
                     FROM daily_prices
                     WHERE ticker IN ({placeholders})
                         AND date BETWEEN ? AND ?
@@ -564,6 +653,9 @@ def get_price_history(
                 "close",
                 "total_return_index",
                 "volume",
+                "short_interest",
+                "equity_float",
+                "analyst_sentiment",
             ]
         )
     return pd.concat(frames, ignore_index=True)
@@ -952,3 +1044,191 @@ def get_security_metadata(
             upsert_security_metadata(downloaded, database)
 
     return load_security_metadata(unique_tickers, database)
+
+
+def _parse_iso_date(value: str) -> date:
+    """Parse a YYYY-MM-DD command-line date."""
+    try:
+        return date.fromisoformat(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "Dates must use YYYY-MM-DD format."
+        ) from error
+
+
+def _resolve_cache_portfolios(
+    csv_files: list[Path],
+) -> list[Path]:
+    """Resolve explicit portfolios or discover every portfolio in port_data."""
+    from construct_port import PORTFOLIO_DATA_DIR, resolve_portfolio_path
+
+    if csv_files:
+        return [resolve_portfolio_path(csv_file) for csv_file in csv_files]
+
+    portfolio_paths = sorted(
+        PORTFOLIO_DATA_DIR.glob("US_live_port_*.csv")
+    )
+    if not portfolio_paths:
+        raise FileNotFoundError(
+            f"No US_live_port_YYYYMMDD.csv files found in "
+            f"{PORTFOLIO_DATA_DIR}."
+        )
+    return portfolio_paths
+
+
+def main() -> None:
+    """Preload Bloomberg portfolio data into the SQLite cache."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Download Bloomberg history, market caps, and metadata into "
+            "the local SQLite cache before running portfolio reports."
+        )
+    )
+    parser.add_argument(
+        "portfolio_csv",
+        nargs="*",
+        type=Path,
+        help=(
+            "Portfolio CSVs to include. If omitted, all "
+            "US_live_port_*.csv files in port_data are used."
+        ),
+    )
+    parser.add_argument(
+        "--start-date",
+        type=_parse_iso_date,
+        help=(
+            "First Bloomberg history date in YYYY-MM-DD format. Defaults "
+            "to enough calendar history for --lookback-days."
+        ),
+    )
+    parser.add_argument(
+        "--end-date",
+        type=_parse_iso_date,
+        help=(
+            "Last Bloomberg history date in YYYY-MM-DD format. Defaults "
+            "to the latest selected portfolio date."
+        ),
+    )
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=DEFAULT_CACHE_LOOKBACK_DAYS,
+        help=(
+            "Trading-day history used to infer --start-date "
+            "(default: 252)."
+        ),
+    )
+    parser.add_argument(
+        "--benchmark",
+        default=DEFAULT_BENCHMARK,
+        help="Benchmark ticker to cache (default: VTHR).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help="Sequential Bloomberg request batch size (default: 50).",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help="Retries for failed Bloomberg requests (default: 3).",
+    )
+    parser.add_argument(
+        "--database",
+        type=Path,
+        default=BLOOMBERG_DATABASE,
+        help=(
+            "SQLite output path (default: port_data/bloomberg_data.db)."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.lookback_days <= 1:
+        parser.error("--lookback-days must be greater than one.")
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive.")
+    if args.max_retries < 0:
+        parser.error("--max-retries cannot be negative.")
+
+    from construct_port import get_portfolio_date, load_shares
+
+    portfolio_paths = _resolve_cache_portfolios(args.portfolio_csv)
+    portfolios = [
+        (
+            portfolio_path,
+            get_portfolio_date(portfolio_path),
+            load_shares(portfolio_path),
+        )
+        for portfolio_path in portfolio_paths
+    ]
+    end_date = args.end_date or max(
+        portfolio_date for _, portfolio_date, _ in portfolios
+    )
+    selected_portfolios = [
+        portfolio
+        for portfolio in portfolios
+        if portfolio[1] <= end_date
+    ]
+    if not selected_portfolios:
+        parser.error("No selected portfolio exists on or before --end-date.")
+
+    first_portfolio_date = min(
+        portfolio_date
+        for _, portfolio_date, _ in selected_portfolios
+    )
+    calendar_days = math.ceil(
+        args.lookback_days * HISTORY_CALENDAR_MULTIPLIER
+    )
+    start_date = args.start_date or (
+        first_portfolio_date - timedelta(days=calendar_days)
+    )
+    if start_date > end_date:
+        parser.error("--start-date cannot be after --end-date.")
+
+    portfolio_tickers = pd.Index([], dtype="object", name="ticker")
+    for _, _, shares in selected_portfolios:
+        portfolio_tickers = portfolio_tickers.union(shares.index)
+    history_tickers = portfolio_tickers.union(
+        pd.Index([args.benchmark], name="ticker")
+    )
+
+    database_path = initialize_price_database(args.database)
+    ensure_price_history(
+        tickers=history_tickers,
+        start_date=start_date,
+        end_date=end_date,
+        batch_size=args.batch_size,
+        max_retries=args.max_retries,
+        database=database_path,
+    )
+    for _, portfolio_date, shares in selected_portfolios:
+        get_historical_market_caps(
+            tickers=shares.index,
+            as_of_date=portfolio_date,
+            batch_size=args.batch_size,
+            max_retries=args.max_retries,
+            database=database_path,
+        )
+    get_security_metadata(
+        tickers=portfolio_tickers,
+        batch_size=args.batch_size,
+        max_retries=args.max_retries,
+        database=database_path,
+    )
+
+    portfolio_dates = {
+        portfolio_date for _, portfolio_date, _ in selected_portfolios
+    }
+    print("Bloomberg cache updated")
+    print(f"Database       : {database_path.resolve()}")
+    print(f"Portfolio files: {len(selected_portfolios):,}")
+    print(f"Portfolio dates: {len(portfolio_dates):,}")
+    print(f"Position tickers: {len(portfolio_tickers):,}")
+    print(f"Benchmark      : {args.benchmark}")
+    print(f"History range  : {start_date} through {end_date}")
+
+
+if __name__ == "__main__":
+    main()
