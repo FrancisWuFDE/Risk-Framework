@@ -517,6 +517,18 @@ def main() -> None:
         default=0.95,
         help="One-day parametric VaR confidence (default: 0.95).",
     )
+    parser.add_argument(
+        "--mac3-model",
+        help=(
+            "Bloomberg MAC3 model identifier to report from the local "
+            "Risk Model Files cache. Omit to skip the MAC3 report."
+        ),
+    )
+    parser.add_argument(
+        "--mac3-horizon",
+        default="quarterly",
+        help="Cached MAC3 forecast horizon (default: quarterly).",
+    )
     args = parser.parse_args()
 
     from risk_metrics import (
@@ -572,14 +584,15 @@ def main() -> None:
     output_path = write_position_changes(summary)
     print(f"\nPosition differences written to: {output_path}")
 
+    today_prices = load_prices(
+        today_path,
+        batch_size=args.batch_size,
+        max_retries=args.max_retries,
+        allow_download=False,
+    )
     risk_report = create_risk_report(
         shares=today_shares,
-        prices=load_prices(
-            today_path,
-            batch_size=args.batch_size,
-            max_retries=args.max_retries,
-            allow_download=False,
-        ),
+        prices=today_prices,
         market_caps=summary.market_caps,
         as_of_date=summary.as_of_date,
         capital=summary.capital,
@@ -594,6 +607,29 @@ def main() -> None:
     print(f"\n{format_risk_report(risk_report)}")
     risk_output_path = write_risk_contributions(risk_report)
     print(f"\nRisk contributions written to: {risk_output_path}")
+
+    if args.mac3_model:
+        from mac3_cache import (
+            calculate_mac3_factor_risk,
+            format_mac3_risk_report,
+            write_mac3_factor_risk,
+        )
+
+        mac3_weights = today_shares.mul(today_prices).div(summary.capital)
+        mac3_report = calculate_mac3_factor_risk(
+            weights=mac3_weights,
+            capital=summary.capital,
+            as_of_date=summary.as_of_date,
+            model=args.mac3_model,
+            horizon=args.mac3_horizon,
+            database=BLOOMBERG_DATABASE,
+        )
+        print(f"\n{format_mac3_risk_report(mac3_report)}")
+        mac3_output_path = write_mac3_factor_risk(
+            mac3_report,
+            PORTFOLIO_DATA_DIR,
+        )
+        print(f"\nMAC3 factor risks written to: {mac3_output_path}")
 
 
 if __name__ == "__main__":
