@@ -8,7 +8,7 @@ import time
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -29,8 +29,8 @@ from pandas.tseries.offsets import CustomBusinessDay
 
 from construct_port import (
     PORTFOLIO_DATA_DIR,
-    PORTFOLIO_FILENAME_PATTERN,
-    _validate_portfolio_filename,
+    get_portfolio_date,
+    get_portfolio_type,
     load_prices,
     load_shares,
     resolve_portfolio_path,
@@ -38,6 +38,7 @@ from construct_port import (
 from price_cache import (
     YFINANCE_DATABASE,
     ensure_price_history,
+    get_price_history,
     get_prices_for_date,
     load_historical_market_caps,
     upsert_historical_market_caps,
@@ -46,6 +47,8 @@ from price_cache import (
 
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_MAX_RETRIES = 3
+DEFAULT_ADV_LOOKBACK_DAYS = 20
+HISTORY_CALENDAR_MULTIPLIER = 2.25
 RETRY_BACKOFF_SECONDS = 1.0
 SHARES_LOOKBACK_DAYS = 730
 MarketCapProvider = Callable[[pd.Index, pd.Series, date], pd.Series]
@@ -96,6 +99,7 @@ NYSE_TRADING_DAY = CustomBusinessDay(calendar=NyseHolidayCalendar())
 class PortfolioSummary:
     """Store portfolio-level metrics and ticker-level share changes."""
 
+    portfolio_type: str
     as_of_date: date
     previous_date: date
     number_of_stocks: int
@@ -108,25 +112,27 @@ class PortfolioSummary:
     market_value_change: float
     position_changes: pd.Series
     market_caps: pd.Series
+    adv_lookback_days: int
+    median_adv: float
+    median_dollar_adv: float
+    median_position_pct_adv: float
+    maximum_position_pct_adv: float
+    adv_by_position: pd.DataFrame
 
 
 def _portfolio_date(csv_file: str | Path) -> date:
     """Return the date encoded in a validated portfolio filename."""
-    csv_path = _validate_portfolio_filename(csv_file)
-    match = PORTFOLIO_FILENAME_PATTERN.fullmatch(csv_path.name)
-    if match is None:
-        raise ValueError(f"Invalid portfolio filename: {csv_path.name}.")
-
-    return datetime.strptime(match.group("date"), "%Y%m%d").date()
+    return get_portfolio_date(csv_file)
 
 
 def find_previous_portfolio(today_csv: str | Path) -> Path:
     """Return the portfolio from the immediately preceding NYSE session."""
     today_path = resolve_portfolio_path(today_csv)
     today_date = _portfolio_date(today_path)
+    portfolio_type = get_portfolio_type(today_path)
     previous_date = (pd.Timestamp(today_date) - NYSE_TRADING_DAY).date()
     previous_path = today_path.with_name(
-        f"US_live_port_{previous_date:%Y%m%d}.csv"
+        f"{portfolio_type}_{previous_date:%Y%m%d}.csv"
     )
 
     if not previous_path.is_file():
@@ -159,6 +165,106 @@ def calculate_position_changes(
     return changes
 
 
+def calculate_average_daily_volumes(
+    raw_close: pd.DataFrame,
+    volumes: pd.DataFrame,
+    lookback_days: int = DEFAULT_ADV_LOOKBACK_DAYS,
+) -> pd.DataFrame:
+    """Return trailing share ADV and average daily dollar volume."""
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be positive.")
+
+    aligned_raw_close = raw_close.reindex(
+        index=volumes.index,
+        columns=volumes.columns,
+    )
+    volume_window = volumes.tail(lookback_days)
+    dollar_volume_window = aligned_raw_close.mul(volumes).tail(
+        lookback_days
+    )
+    average_daily_volume = volume_window.mean().where(
+        volume_window.count().eq(lookback_days)
+    )
+    average_daily_dollar_volume = dollar_volume_window.mean().where(
+        dollar_volume_window.count().eq(lookback_days)
+    )
+
+    return pd.DataFrame(
+        {
+            "average_daily_volume": average_daily_volume,
+            "average_daily_dollar_volume": average_daily_dollar_volume,
+        }
+    )
+
+
+def calculate_adv_by_position(
+    shares: pd.Series,
+    prices: pd.Series,
+    as_of_date: date,
+    lookback_days: int = DEFAULT_ADV_LOOKBACK_DAYS,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    allow_download: bool = True,
+) -> pd.DataFrame:
+    """Return share and dollar ADV with position participation ratios."""
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be positive.")
+
+    start_date = as_of_date - timedelta(
+        days=math.ceil(lookback_days * HISTORY_CALENDAR_MULTIPLIER)
+    )
+    history = get_price_history(
+        tickers=shares.index,
+        start_date=start_date,
+        end_date=as_of_date,
+        batch_size=batch_size,
+        max_retries=max_retries,
+        allow_download=allow_download,
+    )
+    raw_close = history.pivot(
+        index="date",
+        columns="ticker",
+        values="close",
+    ).sort_index()
+    volumes = history.pivot(
+        index="date",
+        columns="ticker",
+        values="volume",
+    ).sort_index()
+    average_volumes = calculate_average_daily_volumes(
+        raw_close=raw_close,
+        volumes=volumes,
+        lookback_days=lookback_days,
+    )
+
+    aligned_prices = prices.reindex(shares.index)
+    position_market_value = shares.mul(aligned_prices)
+    results = pd.DataFrame(
+        {
+            "shares": shares,
+            "price": aligned_prices,
+            "position_market_value": position_market_value,
+            "average_daily_volume": average_volumes[
+                "average_daily_volume"
+            ].reindex(shares.index),
+            "average_daily_dollar_volume": average_volumes[
+                "average_daily_dollar_volume"
+            ].reindex(shares.index),
+        },
+        index=shares.index,
+    )
+    results["position_shares_pct_adv"] = shares.abs().div(
+        results["average_daily_volume"]
+    )
+    results["position_value_pct_dollar_adv"] = (
+        position_market_value.abs().div(
+            results["average_daily_dollar_volume"]
+        )
+    )
+    results.index.name = "ticker"
+    return results.sort_index()
+
+
 def write_position_changes(
     summary: PortfolioSummary,
     output_dir: str | Path = PORTFOLIO_DATA_DIR,
@@ -166,11 +272,40 @@ def write_position_changes(
     """Write ticker-level share changes to a dated CSV file."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
+    portfolio_label = (
+        ""
+        if summary.portfolio_type == "US_live_port"
+        else f"_{summary.portfolio_type}"
+    )
     output_path = output_directory / (
-        f"position_diff_{summary.as_of_date:%Y%m%d}.csv"
+        f"position_diff{portfolio_label}_{summary.as_of_date:%Y%m%d}.csv"
     )
     changes = summary.position_changes.rename("shares_difference").to_frame()
     changes.to_csv(output_path, index=True, index_label="ticker")
+    return output_path
+
+
+def write_adv_by_position(
+    summary: PortfolioSummary,
+    output_dir: str | Path = PORTFOLIO_DATA_DIR,
+) -> Path:
+    """Write dated ticker-level ADV and participation calculations."""
+    output_directory = Path(output_dir)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    portfolio_label = (
+        ""
+        if summary.portfolio_type == "US_live_port"
+        else f"_{summary.portfolio_type}"
+    )
+    output_path = output_directory / (
+        f"adv_by_position{portfolio_label}_"
+        f"{summary.as_of_date:%Y%m%d}.csv"
+    )
+    summary.adv_by_position.to_csv(
+        output_path,
+        index=True,
+        index_label="ticker",
+    )
     return output_path
 
 
@@ -449,6 +584,7 @@ def create_portfolio_summary(
     price_batch_size: int = DEFAULT_BATCH_SIZE,
     price_max_retries: int = DEFAULT_MAX_RETRIES,
     allow_price_download: bool = True,
+    adv_lookback_days: int = DEFAULT_ADV_LOOKBACK_DAYS,
 ) -> PortfolioSummary:
     """Calculate current and day-over-day portfolio summary metrics."""
     today_path = resolve_portfolio_path(today_csv)
@@ -472,6 +608,15 @@ def create_portfolio_summary(
     today_prices_for_prior_holdings = get_prices_for_date(
         tickers=previous_shares.index,
         as_of_date=as_of_date,
+        batch_size=price_batch_size,
+        max_retries=price_max_retries,
+        allow_download=allow_price_download,
+    )
+    adv_by_position = calculate_adv_by_position(
+        shares=today_shares,
+        prices=today_prices,
+        as_of_date=as_of_date,
+        lookback_days=adv_lookback_days,
         batch_size=price_batch_size,
         max_retries=price_max_retries,
         allow_download=allow_price_download,
@@ -524,8 +669,13 @@ def create_portfolio_summary(
     previous_market_value = float(
         previous_shares.mul(previous_prices).sum(min_count=1)
     )
+    valid_adv = (
+        adv_by_position["average_daily_volume"].notna()
+        & adv_by_position["average_daily_dollar_volume"].notna()
+    )
 
     return PortfolioSummary(
+        portfolio_type=get_portfolio_type(today_path),
         as_of_date=as_of_date,
         previous_date=_portfolio_date(previous_path),
         number_of_stocks=len(today_shares),
@@ -534,6 +684,7 @@ def create_portfolio_summary(
             (
                 today_prices.notna()
                 & market_caps.reindex(today_shares.index).notna()
+                & valid_adv.reindex(today_shares.index, fill_value=False)
             ).sum()
         ),
         capital=capital_used,
@@ -555,6 +706,29 @@ def create_portfolio_summary(
             previous_shares=previous_shares,
         ),
         market_caps=market_caps,
+        adv_lookback_days=adv_lookback_days,
+        median_adv=float(
+            adv_by_position.loc[valid_adv, "average_daily_volume"].median()
+        ),
+        median_dollar_adv=float(
+            adv_by_position.loc[
+                valid_adv,
+                "average_daily_dollar_volume",
+            ].median()
+        ),
+        median_position_pct_adv=float(
+            adv_by_position.loc[
+                valid_adv,
+                "position_shares_pct_adv",
+            ].median()
+        ),
+        maximum_position_pct_adv=float(
+            adv_by_position.loc[
+                valid_adv,
+                "position_shares_pct_adv",
+            ].max()
+        ),
+        adv_by_position=adv_by_position,
     )
 
 
@@ -587,8 +761,22 @@ def format_portfolio_summary(summary: PortfolioSummary) -> str:
             "Ticker coverage",
             f"{summary.ticker_coverage:,}/{summary.number_of_stocks:,}",
         ),
+        ("ADV lookback", f"{summary.adv_lookback_days} trading days"),
+        ("Median share ADV", f"{summary.median_adv:,.0f}"),
+        (
+            "Median dollar ADV",
+            _format_dollars(summary.median_dollar_adv),
+        ),
+        (
+            "Median position / ADV",
+            f"{summary.median_position_pct_adv:.2%}",
+        ),
+        (
+            "Maximum position / ADV",
+            f"{summary.maximum_position_pct_adv:.2%}",
+        ),
         ("Capital", _format_dollars(summary.capital)),
-        ("Daily return", f"{summary.daily_return:.2%}"),
+        ("Daily return", f"{summary.daily_return:.8%}"),
         ("Daily turnover", f"{summary.daily_turnover:.2%}"),
         ("Market value", _format_dollars(summary.market_value)),
         (
@@ -614,8 +802,8 @@ def main() -> None:
         "today_csv",
         type=Path,
         help=(
-            "Today's portfolio filename in port_data, or an explicit path "
-            "to a US_live_port_YYYYMMDD.csv file."
+            "Today's dated full, long, or short portfolio filename in "
+            "port_data, or an explicit path."
         ),
     )
     parser.add_argument(
@@ -650,6 +838,12 @@ def main() -> None:
         help="Trading-day lookback for risk metrics (default: 252).",
     )
     parser.add_argument(
+        "--adv-lookback-days",
+        type=int,
+        default=DEFAULT_ADV_LOOKBACK_DAYS,
+        help="Trading-day lookback for ADV calculations (default: 20).",
+    )
+    parser.add_argument(
         "--minimum-observations",
         type=int,
         default=60,
@@ -664,7 +858,7 @@ def main() -> None:
     args = parser.parse_args()
 
     from risk_metrics import (
-        HISTORY_CALENDAR_MULTIPLIER,
+        DEFAULT_RELATIVE_STRENGTH_LOOKBACK_DAYS,
         create_risk_report,
         format_risk_report,
         write_risk_contributions,
@@ -681,7 +875,12 @@ def main() -> None:
     )
     price_start_date = as_of_date - timedelta(
         days=math.ceil(
-            args.risk_lookback_days * HISTORY_CALENDAR_MULTIPLIER
+            max(
+                args.risk_lookback_days,
+                args.adv_lookback_days,
+                DEFAULT_RELATIVE_STRENGTH_LOOKBACK_DAYS,
+            )
+            * HISTORY_CALENDAR_MULTIPLIER
         )
     )
     ensure_price_history(
@@ -706,10 +905,13 @@ def main() -> None:
         price_batch_size=args.batch_size,
         price_max_retries=args.max_retries,
         allow_price_download=False,
+        adv_lookback_days=args.adv_lookback_days,
     )
     print(format_portfolio_summary(summary))
     output_path = write_position_changes(summary)
     print(f"\nPosition differences written to: {output_path}")
+    adv_output_path = write_adv_by_position(summary)
+    print(f"\nADV by position written to: {adv_output_path}")
 
     risk_report = create_risk_report(
         shares=today_shares,
@@ -721,6 +923,7 @@ def main() -> None:
         ),
         market_caps=summary.market_caps,
         as_of_date=summary.as_of_date,
+        portfolio_type=summary.portfolio_type,
         capital=summary.capital,
         benchmark=args.benchmark,
         lookback_days=args.risk_lookback_days,

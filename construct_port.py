@@ -17,8 +17,14 @@ from price_cache import (
 )
 
 
+PORTFOLIO_TYPES = (
+    "US_live_port",
+    "long_positions",
+    "short_positions",
+)
 PORTFOLIO_FILENAME_PATTERN = re.compile(
-    r"^US_live_port_(?P<date>\d{8})\.csv$"
+    rf"^(?P<portfolio_type>{'|'.join(PORTFOLIO_TYPES)})_"
+    r"(?P<date>\d{8})\.csv$"
 )
 PORTFOLIO_DATA_DIR = Path(__file__).resolve().parent / "port_data"
 REQUIRED_COLUMNS = {"ticker", "shares"}
@@ -31,7 +37,9 @@ def _validate_portfolio_filename(csv_file: str | Path) -> Path:
 
     if match is None:
         raise ValueError(
-            "CSV filename must match 'US_live_port_YYYYMMDD.csv'."
+            "CSV filename must match 'US_live_port_YYYYMMDD.csv', "
+            "'long_positions_YYYYMMDD.csv', or "
+            "'short_positions_YYYYMMDD.csv'."
         )
 
     try:
@@ -64,6 +72,16 @@ def get_portfolio_date(csv_file: str | Path) -> date:
         raise ValueError(f"Invalid portfolio filename: {csv_path.name}.")
 
     return datetime.strptime(match.group("date"), "%Y%m%d").date()
+
+
+def get_portfolio_type(csv_file: str | Path) -> str:
+    """Return the validated portfolio filename type."""
+    csv_path = _validate_portfolio_filename(csv_file)
+    match = PORTFOLIO_FILENAME_PATTERN.fullmatch(csv_path.name)
+    if match is None:
+        raise ValueError(f"Invalid portfolio filename: {csv_path.name}.")
+
+    return match.group("portfolio_type")
 
 
 def _read_portfolio_csv(csv_file: str | Path) -> pd.DataFrame:
@@ -134,8 +152,8 @@ def main() -> None:
         "csv_file",
         type=Path,
         help=(
-            "Portfolio filename in port_data, or an explicit path to a "
-            "US_live_port_YYYYMMDD.csv file."
+            "Dated full, long, or short portfolio filename in port_data, "
+            "or an explicit path."
         ),
     )
     args = parser.parse_args()

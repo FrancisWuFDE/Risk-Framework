@@ -82,6 +82,25 @@ def initialize_price_database(
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS short_interest (
+                ticker TEXT NOT NULL,
+                report_date TEXT NOT NULL,
+                shares_short REAL,
+                float_shares REAL,
+                short_percent_float REAL NOT NULL,
+                retrieved_at TEXT NOT NULL,
+                PRIMARY KEY (ticker, report_date)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_short_interest_report_date
+            ON short_interest (report_date)
+            """
+        )
         connection.commit()
 
     return database_path
@@ -713,6 +732,122 @@ def upsert_security_metadata(
             ON CONFLICT (ticker) DO UPDATE SET
                 sector = excluded.sector,
                 price_to_book = excluded.price_to_book,
+                retrieved_at = excluded.retrieved_at
+            """,
+            rows,
+        )
+        connection.commit()
+
+
+def load_short_interest(
+    tickers: pd.Index,
+    as_of_date: date,
+    database: str | Path = YFINANCE_DATABASE,
+) -> pd.DataFrame:
+    """Return each ticker's latest reported short interest by a date."""
+    unique_tickers = pd.Index(
+        tickers.astype(str).unique(),
+        name="ticker",
+    )
+    database_path = initialize_price_database(database)
+    frames: list[pd.DataFrame] = []
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        ticker_list = unique_tickers.tolist()
+        for start in range(0, len(ticker_list), 900):
+            batch = ticker_list[start : start + 900]
+            placeholders = ", ".join("?" for _ in batch)
+            frame = pd.read_sql_query(
+                f"""
+                SELECT
+                    ticker,
+                    report_date,
+                    shares_short,
+                    float_shares,
+                    short_percent_float,
+                    retrieved_at
+                FROM short_interest
+                WHERE ticker IN ({placeholders})
+                    AND report_date <= ?
+                ORDER BY ticker, report_date
+                """,
+                connection,
+                params=[*batch, as_of_date.isoformat()],
+            )
+            frames.append(frame)
+
+    columns = [
+        "report_date",
+        "shares_short",
+        "float_shares",
+        "short_percent_float",
+        "retrieved_at",
+    ]
+    if not frames:
+        return pd.DataFrame(index=unique_tickers, columns=columns)
+
+    short_interest = pd.concat(frames, ignore_index=True)
+    if short_interest.empty:
+        return pd.DataFrame(index=unique_tickers, columns=columns)
+
+    short_interest = short_interest.drop_duplicates(
+        "ticker",
+        keep="last",
+    ).set_index("ticker")
+    short_interest["report_date"] = pd.to_datetime(
+        short_interest["report_date"]
+    ).dt.date
+    return short_interest.reindex(unique_tickers)
+
+
+def upsert_short_interest(
+    short_interest: pd.DataFrame,
+    database: str | Path = YFINANCE_DATABASE,
+) -> None:
+    """Store successful reported short-interest snapshots in SQLite."""
+    if short_interest.empty:
+        return
+
+    frame = short_interest.copy()
+    if "ticker" not in frame.columns:
+        frame = frame.reset_index()
+        frame = frame.rename(columns={frame.columns[0]: "ticker"})
+    retrieved_at = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+    rows = [
+        (
+            str(row.ticker),
+            pd.Timestamp(row.report_date).date().isoformat(),
+            None if pd.isna(row.shares_short) else float(row.shares_short),
+            None if pd.isna(row.float_shares) else float(row.float_shares),
+            float(row.short_percent_float),
+            retrieved_at,
+        )
+        for row in frame.itertuples(index=False)
+        if not pd.isna(row.report_date)
+        and not pd.isna(row.short_percent_float)
+    ]
+    if not rows:
+        return
+
+    database_path = initialize_price_database(database)
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executemany(
+            """
+            INSERT INTO short_interest (
+                ticker,
+                report_date,
+                shares_short,
+                float_shares,
+                short_percent_float,
+                retrieved_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (ticker, report_date) DO UPDATE SET
+                shares_short = excluded.shares_short,
+                float_shares = excluded.float_shares,
+                short_percent_float = excluded.short_percent_float,
                 retrieved_at = excluded.retrieved_at
             """,
             rows,
