@@ -1,0 +1,246 @@
+PORTFOLIO SUMMARY
+========================================================================
+As of                       : 2026-01-28
+Number of stocks            : 2,016
+Weighted average market cap : $52.53B
+Ticker coverage             : 1,985/2,016
+Capital                     : $295,898,086.95
+Daily return                : 0.03%
+Daily turnover              : 23.95%
+Market value                : $1,074,694.70
+Market value change         : $576,597.89
+
+Position differences written to: C:\Users\FrancisWu\OneDrive - Five Dimensions Energy\Risk Framework\port_data\position_diff_20260128.csv
+
+RISK METRICS
+========================================================================================
+Long exposure            :      $148,486,390.82 (  50.18%)
+Short exposure           :     $-147,411,696.13 ( -49.82%)
+Gross exposure           :      $295,898,086.95 ( 100.00%)
+Net exposure             :        $1,074,694.70 (   0.36%)
+Beta exposure            :               0.0024
+Annualized volatility    :                1.12%
+Daily volatility         :                0.07%
+1-day 95% VaR            :          $341,920.36
+Covariance coverage      :      1,985/2,016
+
+SECTOR EXPOSURES
+----------------------------------------------------------------------------------------
+                        long  short    net  gross
+sector                                           
+Financial Services     9.14% -8.95%  0.19% 18.09%
+Industrials            8.18% -8.39% -0.22% 16.57%
+Technology             8.00% -7.10%  0.90% 15.10%
+Healthcare             5.68% -5.69% -0.01% 11.36%
+Consumer Cyclical      5.52% -5.54% -0.02% 11.07%
+Real Estate            3.30% -3.91% -0.61%  7.21%
+Consumer Defensive     2.89% -3.02% -0.13%  5.90%
+Basic Materials        2.46% -1.99%  0.48%  4.45%
+Energy                 1.73% -1.97% -0.24%  3.71%
+Communication Services 1.71% -1.75% -0.04%  3.46%
+Utilities              1.57% -1.49%  0.08%  3.06%
+Unclassified           0.00% -0.02% -0.02%  0.02%
+
+FACTOR EXPOSURES
+----------------------------------------------------------------------------------------
+           exposure ticker_coverage
+size        +0.0003           1,985
+value       +0.0150           1,895
+momentum    +0.0188           1,985
+volatility  -0.0060           1,985
+liquidity   +0.0031           1,985
+
+TOP 20 COMPONENT RISK CONTRIBUTIONS
+----------------------------------------------------------------------------------------
+        weight  beta beta_contribution component_contribution percentage_contribution
+ticker                                                                               
+ALGN   -0.183% 1.248           -0.0023                +0.021%                  +1.87%
+IQV    -0.230% 1.044           -0.0024                +0.021%                  +1.86%
+CAH    +0.248% 0.340           +0.0008                +0.018%                  +1.61%
+HRI    -0.136% 1.630           -0.0022                +0.018%                  +1.61%
+MPWR   -0.242% 2.190           -0.0053                +0.017%                  +1.56%
+ALNY   +0.181% 0.887           +0.0016                +0.017%                  +1.53%
+W      -0.128% 2.488           -0.0032                +0.017%                  +1.53%
+LITE   +0.141% 2.305           +0.0032                +0.017%                  +1.50%
+CRL    -0.107% 1.391           -0.0015                +0.017%                  +1.49%
+RKT    -0.108% 0.728           -0.0008                +0.016%                  +1.39%
+PM     +0.206% 0.097           +0.0002                +0.014%                  +1.25%
+RVTY   -0.137% 1.148           -0.0016                +0.013%                  +1.16%
+FOR    -0.126% 0.805           -0.0010                +0.013%                  +1.16%
+NFE    -0.058% 2.199           -0.0013                +0.012%                  +1.07%
+SPOT   +0.151% 0.964           +0.0015                +0.012%                  +1.04%
+ICLR   -0.093% 0.982           -0.0009                +0.011%                  +1.01%
+UHS    +0.175% 0.664           +0.0012                +0.011%                  +1.00%
+NXPI   -0.206% 1.799           -0.0037                +0.011%                  +0.99%
+EQT    +0.142% 0.751           +0.0011                +0.011%                  +0.95%
+JOBY   -0.085% 1.871           -0.0016                +0.010%                  +0.94%
+
+Risk contributions written to: C:\Users\FrancisWu\OneDrive - Five Dimensions Energy\Risk Framework\port_data\risk_contribution_20260128.csv
+PORTFOLIO SUMMARY
+========================================================================
+As of                       : 2026-01-28
+Number of stocks            : 2,016
+Weighted average market cap : $52.53B
+Ticker coverage             : 1,985/2,016
+Capital                     : $295,898,086.95
+Daily return                : 0.05%
+Daily turnover              : 23.95%
+Market value                : $1,074,694.70
+Market value change         : $576,597.89
+
+Position differences written to: C:\Users\FrancisWu\OneDrive - Five Dimensions Energy\Risk Framework\port_data\position_diff_20260128.csv
+
+RISK METRICS
+========================================================================================
+Long exposure            :      $148,486,390.82 (  50.18%)
+Short exposure           :     $-147,411,696.13 ( -49.82%)
+Gross exposure           :      $295,898,086.95 ( 100.00%)
+Net exposure             :        $1,074,694.70 (   0.36%)
+Beta exposure            :               0.0024
+Annualized volatility    :                1.12%
+Daily volatility         :                0.07%
+1-day 95% VaR            :          $341,920.36
+Covariance coverage      :      1,985/2,016
+
+SECTOR EXPOSURES
+----------------------------------------------------------------------------------------
+                        long  short    net  gross
+sector                                           
+Financial Services     9.14% -8.95%  0.19% 18.09%
+Industrials            8.18% -8.39% -0.22% 16.57%
+Technology             8.00% -7.10%  0.90% 15.10%
+Healthcare             5.68% -5.69% -0.01% 11.36%
+Consumer Cyclical      5.52% -5.54% -0.02% 11.07%
+Real Estate            3.30% -3.91% -0.61%  7.21%
+Consumer Defensive     2.89% -3.02% -0.13%  5.90%
+Basic Materials        2.46% -1.99%  0.48%  4.45%
+Energy                 1.73% -1.97% -0.24%  3.71%
+Communication Services 1.71% -1.75% -0.04%  3.46%
+Utilities              1.57% -1.49%  0.08%  3.06%
+Unclassified           0.00% -0.02% -0.02%  0.02%
+
+FACTOR EXPOSURES
+----------------------------------------------------------------------------------------
+           exposure ticker_coverage
+size        +0.0003           1,985
+value       +0.0150           1,895
+momentum    +0.0188           1,985
+volatility  -0.0060           1,985
+liquidity   +0.0031           1,985
+
+TOP 20 COMPONENT RISK CONTRIBUTIONS
+----------------------------------------------------------------------------------------
+        weight  beta beta_contribution component_contribution percentage_contribution
+ticker                                                                               
+ALGN   -0.183% 1.248           -0.0023                +0.021%                  +1.87%
+IQV    -0.230% 1.044           -0.0024                +0.021%                  +1.86%
+CAH    +0.248% 0.340           +0.0008                +0.018%                  +1.61%
+HRI    -0.136% 1.630           -0.0022                +0.018%                  +1.61%
+MPWR   -0.242% 2.190           -0.0053                +0.017%                  +1.56%
+ALNY   +0.181% 0.887           +0.0016                +0.017%                  +1.53%
+W      -0.128% 2.488           -0.0032                +0.017%                  +1.53%
+LITE   +0.141% 2.305           +0.0032                +0.017%                  +1.50%
+CRL    -0.107% 1.391           -0.0015                +0.017%                  +1.49%
+RKT    -0.108% 0.728           -0.0008                +0.016%                  +1.39%
+PM     +0.206% 0.097           +0.0002                +0.014%                  +1.25%
+RVTY   -0.137% 1.148           -0.0016                +0.013%                  +1.16%
+FOR    -0.126% 0.805           -0.0010                +0.013%                  +1.16%
+NFE    -0.058% 2.199           -0.0013                +0.012%                  +1.07%
+SPOT   +0.151% 0.964           +0.0015                +0.012%                  +1.04%
+ICLR   -0.093% 0.982           -0.0009                +0.011%                  +1.01%
+UHS    +0.175% 0.664           +0.0012                +0.011%                  +1.00%
+NXPI   -0.206% 1.799           -0.0037                +0.011%                  +0.99%
+EQT    +0.142% 0.751           +0.0011                +0.011%                  +0.95%
+JOBY   -0.085% 1.871           -0.0016                +0.010%                  +0.94%
+
+Risk contributions written to: C:\Users\FrancisWu\OneDrive - Five Dimensions Energy\Risk Framework\port_data\risk_contribution_20260128.csv
+PORTFOLIO SUMMARY
+========================================================================
+As of                       : 2026-01-28
+Number of stocks            : 2,016
+Weighted average market cap : $52.53B
+Ticker coverage             : 1,985/2,016
+ADV lookback                : 20 trading days
+Median share ADV            : 1,073,095
+Median dollar ADV           : $58,147,022.47
+Median position / ADV       : 0.13%
+Maximum position / ADV      : 16.15%
+Capital                     : $295,898,086.95
+Daily return                : 0.04619040%
+Daily turnover              : 23.95%
+Market value                : $1,074,694.70
+Market value change         : $576,597.89
+
+Position differences written to: C:\Users\FrancisWu\OneDrive - Five Dimensions Energy\Risk Framework\port_data\position_diff_20260128.csv
+
+ADV by position written to: C:\Users\FrancisWu\OneDrive - Five Dimensions Energy\Risk Framework\port_data\adv_by_position_20260128.csv
+
+RISK METRICS
+========================================================================================
+Long exposure            :      $148,486,390.82 (  50.18%)
+Short exposure           :     $-147,411,696.13 ( -49.82%)
+Gross exposure           :      $295,898,086.95 ( 100.00%)
+Net exposure             :        $1,074,694.70 (   0.36%)
+Beta exposure            :               0.0020
+Annualized volatility    :                1.12%
+Daily volatility         :                0.07%
+Systematic volatility    :                0.28% (  8.41% of factor-model variance)
+Idiosyncratic volatility :                0.91% ( 91.59% of factor-model variance)
+Factor-model volatility  :                0.96%
+1-day 95% VaR            :          $341,920.36
+Covariance coverage      :      1,985/2,016
+
+SECTOR EXPOSURES
+----------------------------------------------------------------------------------------
+                        long  short    net  gross
+sector                                           
+Financial Services     9.14% -8.95%  0.19% 18.09%
+Industrials            8.18% -8.39% -0.22% 16.57%
+Technology             8.00% -7.10%  0.90% 15.10%
+Healthcare             5.68% -5.69% -0.01% 11.36%
+Consumer Cyclical      5.52% -5.54% -0.02% 11.07%
+Real Estate            3.30% -3.91% -0.61%  7.21%
+Consumer Defensive     2.89% -3.02% -0.13%  5.90%
+Basic Materials        2.46% -1.99%  0.48%  4.45%
+Energy                 1.73% -1.97% -0.24%  3.71%
+Communication Services 1.71% -1.75% -0.04%  3.46%
+Utilities              1.57% -1.49%  0.08%  3.06%
+Unclassified           0.00% -0.02% -0.02%  0.02%
+
+FACTOR EXPOSURES
+----------------------------------------------------------------------------------------
+                    exposure ticker_coverage
+size                 +0.0003           1,985
+value                +0.0150           1,895
+relative_strength    -0.0021           1,985
+short_interest           NaN               0
+short_term_reversal  -0.0780           1,985
+volatility           -0.0060           1,985
+liquidity            +0.0066           1,984
+
+TOP 20 COMPONENT RISK CONTRIBUTIONS
+----------------------------------------------------------------------------------------
+        weight  beta beta_contribution component_contribution percentage_contribution
+ticker                                                                               
+ALGN   -0.183% 1.319           -0.0024                +0.021%                  +1.87%
+IQV    -0.230% 1.086           -0.0025                +0.021%                  +1.86%
+CAH    +0.248% 0.341           +0.0008                +0.018%                  +1.61%
+HRI    -0.136% 1.743           -0.0024                +0.018%                  +1.61%
+MPWR   -0.242% 2.240           -0.0054                +0.017%                  +1.56%
+ALNY   +0.181% 0.890           +0.0016                +0.017%                  +1.53%
+W      -0.128% 2.569           -0.0033                +0.017%                  +1.53%
+LITE   +0.141% 2.387           +0.0034                +0.017%                  +1.50%
+CRL    -0.107% 1.415           -0.0015                +0.017%                  +1.49%
+RKT    -0.108% 0.812           -0.0009                +0.016%                  +1.39%
+PM     +0.206% 0.093           +0.0002                +0.014%                  +1.25%
+RVTY   -0.137% 1.195           -0.0016                +0.013%                  +1.16%
+FOR    -0.126% 0.848           -0.0011                +0.013%                  +1.16%
+NFE    -0.058% 2.295           -0.0013                +0.012%                  +1.07%
+SPOT   +0.151% 0.999           +0.0015                +0.012%                  +1.04%
+ICLR   -0.093% 1.040           -0.0010                +0.011%                  +1.01%
+UHS    +0.175% 0.675           +0.0012                +0.011%                  +1.00%
+NXPI   -0.206% 1.860           -0.0038                +0.011%                  +0.99%
+EQT    +0.142% 0.771           +0.0011                +0.011%                  +0.95%
+JOBY   -0.085% 1.982           -0.0017                +0.010%                  +0.94%
+
+Risk contributions written to: C:\Users\FrancisWu\OneDrive - Five Dimensions Energy\Risk Framework\port_data\risk_contribution_20260128.csv

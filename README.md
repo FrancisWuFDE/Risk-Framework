@@ -68,17 +68,22 @@ data.
 
 ## Portfolio input format
 
-Portfolio files normally belong in `port_data/` and must use this exact naming
-convention:
+Portfolio files normally belong in `port_data/` and must use one of these
+exact naming conventions:
 
 ```text
 US_live_port_YYYYMMDD.csv
+long_positions_YYYYMMDD.csv
+short_positions_YYYYMMDD.csv
 ```
 
-For example:
+For example, these files represent the three supported portfolio types for the
+same date:
 
 ```text
 US_live_port_20260130.csv
+long_positions_20260130.csv
+short_positions_20260130.csv
 ```
 
 The date must be a real calendar date. Each CSV requires unique `ticker` and
@@ -100,9 +105,10 @@ NVDA,-500
 - An identifier that already ends in a recognized yellow key, such as
   `SPX Index`, is sent to Bloomberg unchanged.
 
-`port_summary.py` also requires the portfolio file for the immediately
-preceding NYSE trading session. For example, a Monday portfolio requires the
-previous Friday's file unless Friday was an exchange holiday.
+`port_summary.py` also requires the same portfolio type for the immediately
+preceding NYSE trading session. For example, running
+`long_positions_20260202.csv` requires `long_positions_20260130.csv`; it never
+uses the full or short-only file as the prior portfolio.
 
 ## Download Bloomberg data first
 
@@ -119,14 +125,20 @@ python .\bloomberg_cache.py
 ```
 
 When no portfolio arguments are supplied, the script discovers every valid
-`US_live_port_*.csv` file in `port_data`. It then:
+full, long-only, and short-only dated portfolio CSV in `port_data`. It then:
 
-1. Unions all position tickers.
-2. Adds the VTHR benchmark.
-3. Downloads the required historical data in sequential batches of 50.
-4. Downloads historical market caps for every selected portfolio date.
-5. Downloads GICS sector and price-to-book metadata.
-6. Stores the results in `port_data/bloomberg_data.db`.
+1. Downloads and caches the point-in-time B3000 membership for each selected
+   portfolio date.
+2. Unions the B3000 members with all position tickers.
+3. Adds the VTHR benchmark.
+4. Downloads the required historical data in sequential batches of 50.
+5. Downloads historical market caps for every selected portfolio date.
+6. Downloads GICS sector and price-to-book metadata.
+7. Stores the results in `port_data/bloomberg_data.db`.
+
+The first B3000-backed preload is materially larger than a portfolio-only
+download because factor descriptors must be available across the reference
+universe. Later runs reuse the SQLite history and download only new ranges.
 
 By default, history ends on the latest selected portfolio date. The start date
 is inferred from the earliest selected portfolio date using a 252-trading-day
@@ -149,6 +161,7 @@ python .\bloomberg_cache.py `
     --start-date 2025-01-01 `
     --end-date 2026-01-30 `
     --benchmark VTHR `
+    --factor-universe "B3000 Index" `
     --batch-size 50 `
     --max-retries 3
 ```
@@ -194,6 +207,13 @@ One row per ticker and trading date:
 | `short_interest` | `SHORT_INT` | Short-interest numerator. |
 | `equity_float` | `EQY_FLOAT` | Short-interest denominator. |
 | `analyst_sentiment` | `EQY_REC_CONS` | Historical analyst-consensus level used to calculate recommendation changes. |
+
+### `index_memberships`
+
+One row per index, portfolio date, and member ticker. B3000 membership is
+downloaded through Bloomberg's `INDX_MWEIGHT_HIST` bulk field with an
+`END_DATE_OVERRIDE` equal to the portfolio date. The cached membership defines
+the cross-sectional normalization universe for custom factors.
 
 If Bloomberg does not return a total-return index for an otherwise valid price
 row, the downloader currently falls back to `PX_LAST` for that row.
@@ -333,15 +353,30 @@ A bare filename is also resolved inside `port_data`:
 python .\port_summary.py US_live_port_20260130.csv
 ```
 
+Run the long-only or short-only report with the corresponding split file:
+
+```powershell
+python .\port_summary.py long_positions_20260130.csv
+python .\port_summary.py short_positions_20260130.csv
+```
+
+Use `divide_port.py` to generate both split files from a full portfolio:
+
+```powershell
+python .\divide_port.py US_live_port_20260130.csv
+```
+
 Useful options:
 
 ```powershell
 python .\port_summary.py US_live_port_20260130.csv `
     --benchmark VTHR `
+    --factor-universe "B3000 Index" `
     --risk-lookback-days 252 `
     --adv-lookback-days 20 `
     --liquidation-participation-rate 0.10 `
     --minimum-observations 60 `
+    --downside-threshold 0.0 `
     --var-confidence 0.95 `
     --batch-size 50 `
     --max-retries 3
@@ -366,6 +401,18 @@ Even without a separate preload command, `port_summary.py` first downloads any
 missing historical fields and metadata, then calls the report calculations
 with further price downloads disabled. The calculations therefore use the
 SQLite snapshot established at the beginning of that run.
+
+To bypass Bloomberg completely and use only the existing SQLite cache:
+
+```powershell
+python .\port_summary.py US_live_port_20260130.csv --cache-only
+```
+
+In cache-only mode, the script does not start a Bloomberg session or request
+prices, volume, market caps, sectors, price-to-book, short interest, float, or
+analyst consensus. Required missing data produces an error; partial coverage
+continues to appear as warnings or blank position-level values. Run once
+without `--cache-only` whenever the database needs to be updated.
 
 ## Portfolio summary calculations
 
@@ -445,6 +492,8 @@ Missing positions are treated as zero. Nonzero differences are written to:
 
 ```text
 port_data/position_diff_YYYYMMDD.csv
+port_data/position_diff_long_positions_YYYYMMDD.csv
+port_data/position_diff_short_positions_YYYYMMDD.csv
 ```
 
 ### Average daily volume by position
@@ -477,6 +526,8 @@ complete position table is written to:
 
 ```text
 port_data/adv_by_position_YYYYMMDD.csv
+port_data/adv_by_position_long_positions_YYYYMMDD.csv
+port_data/adv_by_position_short_positions_YYYYMMDD.csv
 ```
 
 The CSV contains shares, current price, signed position market value, share
@@ -541,23 +592,32 @@ reported as `Unclassified`.
 | Size | `log(market cap)` |
 | Value | `1 / price-to-book` for positive P/B values |
 | Relative strength | Stock total-return growth divided by benchmark total-return growth minus one, measured from 63 to 5 trading days ago |
-| Short-term reversal | Negative exponentially weighted sum of returns at lags 2 through 6, using a 3-day half-life |
+| One-day reversal | Negative of the latest completed close-to-close total return; a recent loser has a positive raw score |
+| Short-term reversal | Negative exponentially weighted sum of the five returns immediately preceding the one-day-reversal return, using a 3-day half-life |
 | Short interest | `SHORT_INT / EQY_FLOAT`, using the latest historical values on or before the report date |
 | Sentiment | `EQY_REC_CONS_t - EQY_REC_CONS_t-20`; positive means analyst consensus improved |
 | Volatility | Standard deviation of available daily total returns times `sqrt(252)` |
+| Downside risk | Mean of `min(daily total return - tau, 0)^2` over the risk lookback; tau defaults to zero |
 | Liquidity | 63-day Amihud illiquidity: average of `abs(return) / (close * volume)` |
 
 The factor named `liquidity` is numerically an illiquidity measure. A larger raw
 value means a larger price response per dollar traded and therefore lower
 liquidity.
 
+Downside-risk tau is a minimum acceptable daily return, not a benchmark. The
+default `--downside-threshold 0.0` measures absolute downside by treating only
+negative daily returns as shortfalls. A nonzero value must be supplied as a
+daily decimal return. For example, do not pass an annual 4% target directly;
+convert it to the corresponding daily threshold first.
+
 ### Factor normalization and portfolio exposure
 
 For every factor, the raw stock values are:
 
-1. Winsorized at the 1st and 99th percentiles.
-2. Converted to cross-sectional z-scores with mean zero and population
-   standard deviation one.
+1. Evaluated across the point-in-time B3000 membership.
+2. Winsorized using the B3000 1st and 99th percentiles.
+3. Converted using the winsorized B3000 mean and population standard
+   deviation.
 
 Portfolio factor exposure is then:
 
@@ -565,11 +625,17 @@ Portfolio factor exposure is then:
 factor exposure_f = sum_i signed weight_i * z_score_i,f
 ```
 
-The current normalization universe is the set of portfolio securities with
-usable factor data, not a broad external estimation universe. Missing factor
-scores are excluded, and covered weights are not renormalized. The report's
-`ticker_coverage` column should therefore be considered alongside each
-exposure.
+The default normalization universe is `B3000 Index`; change it with
+`--factor-universe`. Portfolio securities outside B3000 are not allowed to
+change the normalization parameters. When their raw data is available, they
+are scored using the B3000 winsorization bounds, mean, and standard deviation.
+Missing factor scores are excluded, and covered weights are not renormalized.
+The report's `ticker_coverage` column should therefore be considered alongside
+each exposure.
+
+These are B3000-normalized custom exposures, not Bloomberg MAC3 exposures.
+They use comparable z-score units but do not reproduce MAC3's proprietary
+descriptor combinations, estimation weights, or orthogonalization.
 
 Beta and sector exposures are not z-score normalized.
 
@@ -633,6 +699,8 @@ The complete table is written to:
 
 ```text
 port_data/risk_contribution_YYYYMMDD.csv
+port_data/risk_contribution_long_positions_YYYYMMDD.csv
+port_data/risk_contribution_short_positions_YYYYMMDD.csv
 ```
 
 ## Run individual scripts

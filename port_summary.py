@@ -7,7 +7,7 @@ import math
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -27,17 +27,20 @@ from pandas.tseries.offsets import CustomBusinessDay
 
 from construct_port import (
     PORTFOLIO_DATA_DIR,
-    PORTFOLIO_FILENAME_PATTERN,
-    _validate_portfolio_filename,
+    get_portfolio_date,
+    get_portfolio_output_filename,
+    get_portfolio_type,
     load_prices,
     load_shares,
     resolve_portfolio_path,
 )
 from bloomberg_cache import (
     BLOOMBERG_DATABASE,
+    DEFAULT_FACTOR_UNIVERSE,
     ensure_price_history,
-    get_price_history,
     get_historical_market_caps,
+    get_index_members,
+    get_price_history,
     get_security_metadata,
 )
 
@@ -97,6 +100,7 @@ class PortfolioSummary:
 
     as_of_date: date
     previous_date: date
+    portfolio_type: str
     number_of_stocks: int
     weighted_average_market_cap: float
     ticker_coverage: int
@@ -118,23 +122,14 @@ class PortfolioSummary:
     adv_by_position: pd.DataFrame
 
 
-def _portfolio_date(csv_file: str | Path) -> date:
-    """Return the date encoded in a validated portfolio filename."""
-    csv_path = _validate_portfolio_filename(csv_file)
-    match = PORTFOLIO_FILENAME_PATTERN.fullmatch(csv_path.name)
-    if match is None:
-        raise ValueError(f"Invalid portfolio filename: {csv_path.name}.")
-
-    return datetime.strptime(match.group("date"), "%Y%m%d").date()
-
-
 def find_previous_portfolio(today_csv: str | Path) -> Path:
     """Return the portfolio from the immediately preceding NYSE session."""
     today_path = resolve_portfolio_path(today_csv)
-    today_date = _portfolio_date(today_path)
+    today_date = get_portfolio_date(today_path)
+    portfolio_type = get_portfolio_type(today_path)
     previous_date = (pd.Timestamp(today_date) - NYSE_TRADING_DAY).date()
     previous_path = today_path.with_name(
-        f"US_live_port_{previous_date:%Y%m%d}.csv"
+        f"{portfolio_type}_{previous_date:%Y%m%d}.csv"
     )
 
     if not previous_path.is_file():
@@ -302,8 +297,10 @@ def write_position_changes(
     """Write ticker-level share changes to a dated CSV file."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
-    output_path = output_directory / (
-        f"position_diff_{summary.as_of_date:%Y%m%d}.csv"
+    output_path = output_directory / get_portfolio_output_filename(
+        prefix="position_diff",
+        portfolio_type=summary.portfolio_type,
+        as_of_date=summary.as_of_date,
     )
     changes = summary.position_changes.rename("shares_difference").to_frame()
     changes.to_csv(output_path, index=True, index_label="ticker")
@@ -317,8 +314,10 @@ def write_adv_by_position(
     """Write dated ticker-level ADV and participation calculations."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
-    output_path = output_directory / (
-        f"adv_by_position_{summary.as_of_date:%Y%m%d}.csv"
+    output_path = output_directory / get_portfolio_output_filename(
+        prefix="adv_by_position",
+        portfolio_type=summary.portfolio_type,
+        as_of_date=summary.as_of_date,
     )
     summary.adv_by_position.to_csv(
         output_path,
@@ -410,6 +409,7 @@ def get_market_caps(
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_retries: int = DEFAULT_MAX_RETRIES,
     database: str | Path = BLOOMBERG_DATABASE,
+    allow_download: bool = True,
 ) -> pd.Series:
     """Return Bloomberg market caps for a historical portfolio date."""
     del prices
@@ -419,6 +419,7 @@ def get_market_caps(
         batch_size=batch_size,
         max_retries=max_retries,
         database=database,
+        allow_download=allow_download,
     )
 
 
@@ -491,7 +492,8 @@ def create_portfolio_summary(
         max_retries=price_max_retries,
         allow_download=allow_price_download,
     )
-    as_of_date = _portfolio_date(today_path)
+    as_of_date = get_portfolio_date(today_path)
+    portfolio_type = get_portfolio_type(today_path)
     if today_shares.isna().any():
         raise ValueError("Today's shares cannot contain missing values.")
     if previous_shares.isna().any():
@@ -559,7 +561,8 @@ def create_portfolio_summary(
 
     return PortfolioSummary(
         as_of_date=as_of_date,
-        previous_date=_portfolio_date(previous_path),
+        previous_date=get_portfolio_date(previous_path),
+        portfolio_type=portfolio_type,
         number_of_stocks=len(today_shares),
         weighted_average_market_cap=weighted_average_market_cap,
         ticker_coverage=int(
@@ -653,6 +656,14 @@ def format_portfolio_summary(summary: PortfolioSummary) -> str:
     """Return a printable portfolio summary."""
     summary_rows = [
         ("As of", summary.as_of_date.isoformat()),
+        (
+            "Portfolio type",
+            {
+                "US_live_port": "Full portfolio",
+                "long_positions": "Long only",
+                "short_positions": "Short only",
+            }[summary.portfolio_type],
+        ),
         ("Number of stocks", f"{summary.number_of_stocks:,}"),
         (
             "Weighted average market cap",
@@ -716,7 +727,7 @@ def main() -> None:
         type=Path,
         help=(
             "Today's portfolio filename in port_data, or an explicit path "
-            "to a US_live_port_YYYYMMDD.csv file."
+            "to a full, long-only, or short-only dated portfolio CSV."
         ),
     )
     parser.add_argument(
@@ -730,6 +741,14 @@ def main() -> None:
         type=int,
         default=DEFAULT_MAX_RETRIES,
         help="Retries for failed Bloomberg requests (default: 3).",
+    )
+    parser.add_argument(
+        "--cache-only",
+        action="store_true",
+        help=(
+            "Skip every Bloomberg data request and use only data already "
+            "stored in port_data/bloomberg_data.db."
+        ),
     )
     parser.add_argument(
         "--capital",
@@ -769,10 +788,27 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--factor-universe",
+        default=DEFAULT_FACTOR_UNIVERSE,
+        help=(
+            "Bloomberg index used to normalize custom factor scores "
+            f"(default: {DEFAULT_FACTOR_UNIVERSE})."
+        ),
+    )
+    parser.add_argument(
         "--minimum-observations",
         type=int,
         default=60,
         help="Minimum returns required per stock (default: 60).",
+    )
+    parser.add_argument(
+        "--downside-threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Daily minimum acceptable return used as downside-risk tau "
+            "in decimal form (default: 0)."
+        ),
     )
     parser.add_argument(
         "--var-confidence",
@@ -802,11 +838,21 @@ def main() -> None:
 
     today_path = resolve_portfolio_path(args.today_csv)
     previous_path = find_previous_portfolio(today_path)
-    as_of_date = _portfolio_date(today_path)
+    as_of_date = get_portfolio_date(today_path)
+    portfolio_type = get_portfolio_type(today_path)
     today_shares = load_shares(today_path)
     previous_shares = load_shares(previous_path)
+    factor_universe_members = get_index_members(
+        index_ticker=args.factor_universe,
+        as_of_date=as_of_date,
+        max_retries=args.max_retries,
+        allow_download=not args.cache_only,
+    )
+    factor_tickers = factor_universe_members.index.union(
+        today_shares.index
+    )
     price_tickers = (
-        today_shares.index.union(previous_shares.index)
+        factor_tickers.union(previous_shares.index)
         .union(pd.Index([args.benchmark]))
     )
     price_start_date = as_of_date - timedelta(
@@ -815,18 +861,29 @@ def main() -> None:
             * HISTORY_CALENDAR_MULTIPLIER
         )
     )
-    ensure_price_history(
-        tickers=price_tickers,
-        start_date=price_start_date,
-        end_date=as_of_date,
-        batch_size=args.batch_size,
-        max_retries=args.max_retries,
-    )
-    get_security_metadata(
-        tickers=today_shares.index,
-        batch_size=args.batch_size,
-        max_retries=args.max_retries,
-    )
+    if args.cache_only:
+        print(
+            "Bloomberg data collection skipped; using the local cache only."
+        )
+    else:
+        ensure_price_history(
+            tickers=price_tickers,
+            start_date=price_start_date,
+            end_date=as_of_date,
+            batch_size=args.batch_size,
+            max_retries=args.max_retries,
+        )
+        get_security_metadata(
+            tickers=factor_tickers,
+            batch_size=args.batch_size,
+            max_retries=args.max_retries,
+        )
+        get_historical_market_caps(
+            tickers=factor_tickers,
+            as_of_date=as_of_date,
+            batch_size=args.batch_size,
+            max_retries=args.max_retries,
+        )
 
     market_cap_provider = lambda tickers, prices, as_of_date: get_market_caps(
         tickers=tickers,
@@ -834,6 +891,7 @@ def main() -> None:
         as_of_date=as_of_date,
         batch_size=args.batch_size,
         max_retries=args.max_retries,
+        allow_download=not args.cache_only,
     )
     summary = create_portfolio_summary(
         today_csv=args.today_csv,
@@ -868,10 +926,13 @@ def main() -> None:
         benchmark=args.benchmark,
         lookback_days=args.risk_lookback_days,
         minimum_observations=args.minimum_observations,
+        downside_threshold=args.downside_threshold,
         var_confidence=args.var_confidence,
         batch_size=args.batch_size,
         max_retries=args.max_retries,
         allow_price_download=False,
+        portfolio_type=portfolio_type,
+        factor_universe=args.factor_universe,
     )
     print(f"\n{format_risk_report(risk_report)}")
     risk_output_path = write_risk_contributions(risk_report)
@@ -897,6 +958,7 @@ def main() -> None:
         mac3_output_path = write_mac3_factor_risk(
             mac3_report,
             PORTFOLIO_DATA_DIR,
+            portfolio_type=portfolio_type,
         )
         print(f"\nMAC3 factor risks written to: {mac3_output_path}")
 

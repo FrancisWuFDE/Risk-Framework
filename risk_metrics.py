@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import math
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from statistics import NormalDist
 
@@ -13,12 +13,18 @@ import numpy as np
 import pandas as pd
 
 from bloomberg_cache import (
+    DEFAULT_FACTOR_UNIVERSE,
     PRICE_DATABASE,
+    get_historical_market_caps,
+    get_index_members,
     get_price_history,
     get_security_metadata,
 )
 from construct_port import (
     PORTFOLIO_DATA_DIR,
+    get_portfolio_date,
+    get_portfolio_output_filename,
+    get_portfolio_type,
     load_prices,
     load_shares,
     resolve_portfolio_path,
@@ -35,9 +41,11 @@ DEFAULT_BENCHMARK = "VTHR"
 DEFAULT_LIQUIDITY_LOOKBACK_DAYS = 63
 DEFAULT_RELATIVE_STRENGTH_LOOKBACK_DAYS = 63
 DEFAULT_RELATIVE_STRENGTH_SKIP_DAYS = 5
-DEFAULT_SHORT_TERM_REVERSAL_MAX_LAG = 6
+DEFAULT_SHORT_TERM_REVERSAL_LOOKBACK_DAYS = 5
+DEFAULT_SHORT_TERM_REVERSAL_SKIP_DAYS = 1
 DEFAULT_SHORT_TERM_REVERSAL_HALF_LIFE_DAYS = 3.0
 DEFAULT_SENTIMENT_LOOKBACK_DAYS = 20
+DEFAULT_DOWNSIDE_THRESHOLD = 0.0
 HISTORY_CALENDAR_MULTIPLIER = 2.25
 
 
@@ -62,13 +70,9 @@ class RiskReport:
     covariance_coverage: int
     total_positions: int
     risk_contributions: pd.DataFrame
-
-
-def _portfolio_date(csv_file: str | Path) -> date:
-    """Extract the YYYYMMDD date from a resolved portfolio filename."""
-    portfolio_path = resolve_portfolio_path(csv_file)
-    date_text = portfolio_path.stem.removeprefix("US_live_port_")
-    return datetime.strptime(date_text, "%Y%m%d").date()
+    portfolio_type: str = "US_live_port"
+    factor_universe: str = DEFAULT_FACTOR_UNIVERSE
+    factor_universe_size: int = 0
 
 
 def calculate_position_exposures(
@@ -192,21 +196,31 @@ def calculate_sector_exposures(
     return sector_exposures.sort_values("gross", ascending=False)
 
 
-def _zscore(values: pd.Series) -> pd.Series:
-    """Return a winsorized cross-sectional z-score."""
+def _zscore(
+    values: pd.Series,
+    normalization_tickers: pd.Index | None = None,
+) -> pd.Series:
+    """Return a z-score using a fixed cross-sectional reference universe."""
     numeric = pd.to_numeric(values, errors="coerce")
-    valid = numeric.dropna()
-    if len(valid) < 2:
+    reference = (
+        numeric
+        if normalization_tickers is None
+        else numeric.reindex(normalization_tickers)
+    )
+    valid_reference = reference.dropna()
+    if len(valid_reference) < 2:
         return pd.Series(index=values.index, dtype="float64")
 
-    lower = valid.quantile(0.01)
-    upper = valid.quantile(0.99)
+    lower = valid_reference.quantile(0.01)
+    upper = valid_reference.quantile(0.99)
     clipped = numeric.clip(lower=lower, upper=upper)
-    standard_deviation = clipped.std(ddof=0)
+    clipped_reference = valid_reference.clip(lower=lower, upper=upper)
+    reference_mean = clipped_reference.mean()
+    standard_deviation = clipped_reference.std(ddof=0)
     if standard_deviation == 0 or pd.isna(standard_deviation):
         return pd.Series(0.0, index=values.index)
 
-    return clipped.sub(clipped.mean()).div(standard_deviation)
+    return clipped.sub(reference_mean).div(standard_deviation)
 
 
 def calculate_amihud_illiquidity(
@@ -284,20 +298,38 @@ def calculate_relative_strength(
     )
 
 
+def calculate_one_day_reversal(
+    total_return_levels: pd.DataFrame,
+) -> pd.Series:
+    """Return the negative of each stock's latest completed daily return."""
+    if len(total_return_levels) < 2:
+        raise ValueError(
+            "One-day reversal requires at least two price observations."
+        )
+
+    latest_return = total_return_levels.pct_change(
+        fill_method=None
+    ).iloc[-1]
+    return latest_return.mul(-1.0).rename("one_day_reversal")
+
+
 def calculate_short_term_reversal(
     total_return_levels: pd.DataFrame,
-    maximum_lag: int = DEFAULT_SHORT_TERM_REVERSAL_MAX_LAG,
+    lookback_days: int = DEFAULT_SHORT_TERM_REVERSAL_LOOKBACK_DAYS,
+    skip_recent_days: int = DEFAULT_SHORT_TERM_REVERSAL_SKIP_DAYS,
     weight_half_life_days: float = (
         DEFAULT_SHORT_TERM_REVERSAL_HALF_LIFE_DAYS
     ),
 ) -> pd.Series:
-    """Return negative weighted returns from lags two through six."""
-    if maximum_lag < 2:
-        raise ValueError("maximum_lag must be at least 2.")
+    """Return negative weighted returns preceding one-day reversal."""
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be positive.")
+    if skip_recent_days < 0:
+        raise ValueError("skip_recent_days cannot be negative.")
     if weight_half_life_days <= 0:
         raise ValueError("weight_half_life_days must be positive.")
 
-    required_levels = maximum_lag + 2
+    required_levels = lookback_days + skip_recent_days + 1
     if len(total_return_levels) < required_levels:
         raise ValueError(
             f"Short-term reversal requires at least {required_levels} "
@@ -305,9 +337,12 @@ def calculate_short_term_reversal(
         )
 
     returns = total_return_levels.pct_change(fill_method=None)
-    lags = np.arange(2, maximum_lag + 1)
+    lags = np.arange(
+        skip_recent_days,
+        skip_recent_days + lookback_days,
+    )
     decay_factor = 0.5 ** (1.0 / weight_half_life_days)
-    weights = decay_factor ** (lags - 2)
+    weights = decay_factor ** np.arange(lookback_days)
     weights /= weights.sum()
     lagged_returns = pd.DataFrame(
         {lag: returns.shift(lag).iloc[-1] for lag in lags}
@@ -354,6 +389,34 @@ def calculate_recommendation_sentiment(
     return current_consensus.sub(prior_consensus).rename("sentiment")
 
 
+def calculate_downside_variance(
+    daily_returns: pd.DataFrame,
+    threshold: float = DEFAULT_DOWNSIDE_THRESHOLD,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    minimum_observations: int = DEFAULT_MINIMUM_OBSERVATIONS,
+) -> pd.Series:
+    """Return mean squared daily shortfall below a target return."""
+    if not math.isfinite(threshold):
+        raise ValueError("threshold must be finite.")
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be positive.")
+    if minimum_observations <= 0:
+        raise ValueError("minimum_observations must be positive.")
+
+    recent_returns = daily_returns.tail(lookback_days).apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+    squared_shortfall = recent_returns.sub(threshold).clip(
+        upper=0.0
+    ).pow(2)
+    downside_variance = squared_shortfall.mean()
+    valid_observations = recent_returns.notna().sum()
+    return downside_variance.where(
+        valid_observations.ge(minimum_observations)
+    ).rename("downside_risk")
+
+
 def calculate_factor_scores(
     close_prices: pd.DataFrame,
     volumes: pd.DataFrame,
@@ -364,6 +427,10 @@ def calculate_factor_scores(
     equity_float: pd.Series,
     analyst_sentiment: pd.Series,
     liquidity_prices: pd.DataFrame | None = None,
+    downside_threshold: float = DEFAULT_DOWNSIDE_THRESHOLD,
+    downside_lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    minimum_downside_observations: int = DEFAULT_MINIMUM_OBSERVATIONS,
+    normalization_tickers: pd.Index | None = None,
 ) -> pd.DataFrame:
     """Return standardized Bloomberg-backed style-factor scores."""
     returns = close_prices.pct_change(fill_method=None)
@@ -379,7 +446,14 @@ def calculate_factor_scores(
         total_return_levels=close_prices,
         benchmark_levels=benchmark_prices,
     )
+    one_day_reversal = calculate_one_day_reversal(close_prices)
     short_term_reversal = calculate_short_term_reversal(close_prices)
+    downside_risk = calculate_downside_variance(
+        daily_returns=returns,
+        threshold=downside_threshold,
+        lookback_days=downside_lookback_days,
+        minimum_observations=minimum_downside_observations,
+    )
     illiquidity = calculate_amihud_illiquidity(
         total_return_levels=close_prices,
         raw_close=dollar_volume_prices,
@@ -401,6 +475,7 @@ def calculate_factor_scores(
             "size": np.log(market_caps.where(market_caps.gt(0))),
             "value": price_to_book.where(price_to_book.gt(0)).pow(-1),
             "relative_strength": relative_strength,
+            "one_day_reversal": one_day_reversal,
             "short_term_reversal": short_term_reversal,
             "short_interest": short_percent_float.where(
                 short_percent_float.ge(0)
@@ -410,10 +485,14 @@ def calculate_factor_scores(
                 errors="coerce",
             ),
             "volatility": realized_volatility,
+            "downside_risk": downside_risk,
             "liquidity": illiquidity,
         }
     )
-    return raw_factors.apply(_zscore)
+    return raw_factors.apply(
+        _zscore,
+        normalization_tickers=normalization_tickers,
+    )
 
 
 def calculate_factor_exposures(
@@ -515,10 +594,13 @@ def create_risk_report(
     benchmark: str = DEFAULT_BENCHMARK,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     minimum_observations: int = DEFAULT_MINIMUM_OBSERVATIONS,
+    downside_threshold: float = DEFAULT_DOWNSIDE_THRESHOLD,
     var_confidence: float = DEFAULT_VAR_CONFIDENCE,
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_retries: int = DEFAULT_MAX_RETRIES,
     allow_price_download: bool = True,
+    portfolio_type: str = "US_live_port",
+    factor_universe: str = DEFAULT_FACTOR_UNIVERSE,
 ) -> RiskReport:
     """Calculate exposures, factors, covariance risk, and parametric VaR."""
     if not 0 < var_confidence < 1:
@@ -531,7 +613,15 @@ def create_risk_report(
         else float(capital)
     )
     weights = calculate_signed_weights(shares, prices, capital_used)
-    history_tickers = weights.index.union(pd.Index([benchmark]))
+    universe_members = get_index_members(
+        index_ticker=factor_universe,
+        as_of_date=as_of_date,
+        max_retries=max_retries,
+        allow_download=allow_price_download,
+    )
+    normalization_tickers = universe_members.index
+    factor_tickers = normalization_tickers.union(weights.index)
+    history_tickers = factor_tickers.union(pd.Index([benchmark]))
     history = download_market_history(
         tickers=history_tickers,
         as_of_date=as_of_date,
@@ -592,7 +682,7 @@ def create_risk_report(
         fill_method=None
     ).tail(lookback_days)
     benchmark_returns = returns[benchmark]
-    asset_returns = returns.drop(columns=benchmark, errors="ignore")
+    asset_returns = returns.reindex(columns=weights.index)
     betas = calculate_asset_betas(
         asset_returns=asset_returns,
         benchmark_returns=benchmark_returns,
@@ -603,7 +693,7 @@ def create_risk_report(
     )
 
     metadata = get_risk_metadata(
-        tickers=weights.index,
+        tickers=factor_tickers,
         batch_size=batch_size,
         max_retries=max_retries,
         allow_download=allow_price_download,
@@ -612,28 +702,46 @@ def create_risk_report(
         weights=weights,
         sectors=metadata["sector"],
     )
+    factor_market_caps = get_historical_market_caps(
+        tickers=factor_tickers,
+        as_of_date=as_of_date,
+        batch_size=batch_size,
+        max_retries=max_retries,
+        allow_download=allow_price_download,
+    )
+    factor_market_caps.update(
+        pd.to_numeric(market_caps, errors="coerce")
+    )
+    factor_return_levels = return_levels.reindex(columns=factor_tickers)
+    factor_close_prices = close_prices.reindex(columns=factor_tickers)
+    factor_volumes = volumes.reindex(columns=factor_tickers)
+    factor_short_interest = short_interest_history.reindex(
+        columns=factor_tickers
+    )
+    factor_equity_float = equity_float_history.reindex(
+        columns=factor_tickers
+    )
+    factor_sentiment = sentiment_history.reindex(columns=factor_tickers)
     factor_scores = calculate_factor_scores(
-        close_prices=return_levels.drop(
-            columns=benchmark,
-            errors="ignore",
-        ),
-        volumes=volumes.drop(columns=benchmark, errors="ignore"),
-        market_caps=market_caps,
+        close_prices=factor_return_levels,
+        volumes=factor_volumes,
+        market_caps=factor_market_caps,
         price_to_book=metadata["price_to_book"],
         benchmark_prices=return_levels[benchmark],
         short_interest=latest_historical_values(
-            short_interest_history.drop(columns=benchmark, errors="ignore")
+            factor_short_interest
         ),
         equity_float=latest_historical_values(
-            equity_float_history.drop(columns=benchmark, errors="ignore")
+            factor_equity_float
         ),
         analyst_sentiment=calculate_recommendation_sentiment(
-            sentiment_history.drop(columns=benchmark, errors="ignore")
+            factor_sentiment
         ),
-        liquidity_prices=close_prices.drop(
-            columns=benchmark,
-            errors="ignore",
-        ),
+        downside_threshold=downside_threshold,
+        downside_lookback_days=lookback_days,
+        minimum_downside_observations=minimum_observations,
+        liquidity_prices=factor_close_prices,
+        normalization_tickers=normalization_tickers,
     )
     factor_exposures, factor_coverage = calculate_factor_exposures(
         weights=weights,
@@ -685,6 +793,9 @@ def create_risk_report(
         covariance_coverage=len(risk_contributions),
         total_positions=len(weights),
         risk_contributions=risk_contributions,
+        portfolio_type=portfolio_type,
+        factor_universe=factor_universe,
+        factor_universe_size=len(normalization_tickers),
     )
 
 
@@ -730,6 +841,11 @@ def format_risk_report(
                 f"{'Covariance coverage':<24} : "
                 f"{report.covariance_coverage:>10,}/"
                 f"{report.total_positions:,}"
+            ),
+            (
+                f"{'Factor universe':<24} : "
+                f"{report.factor_universe:>20} "
+                f"({report.factor_universe_size:,} members)"
             ),
             "",
             "SECTOR EXPOSURES",
@@ -786,8 +902,10 @@ def write_risk_contributions(
     """Write the complete ticker-level risk contribution table."""
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
-    output_path = output_directory / (
-        f"risk_contribution_{report.as_of_date:%Y%m%d}.csv"
+    output_path = output_directory / get_portfolio_output_filename(
+        prefix="risk_contribution",
+        portfolio_type=report.portfolio_type,
+        as_of_date=report.as_of_date,
     )
     report.risk_contributions.to_csv(
         output_path,
@@ -810,6 +928,14 @@ def main() -> None:
     parser.add_argument("--capital", type=float)
     parser.add_argument("--benchmark", default=DEFAULT_BENCHMARK)
     parser.add_argument(
+        "--factor-universe",
+        default=DEFAULT_FACTOR_UNIVERSE,
+        help=(
+            "Bloomberg index used to normalize custom factor scores "
+            f"(default: {DEFAULT_FACTOR_UNIVERSE})."
+        ),
+    )
+    parser.add_argument(
         "--lookback-days",
         type=int,
         default=DEFAULT_LOOKBACK_DAYS,
@@ -818,6 +944,15 @@ def main() -> None:
         "--var-confidence",
         type=float,
         default=DEFAULT_VAR_CONFIDENCE,
+    )
+    parser.add_argument(
+        "--downside-threshold",
+        type=float,
+        default=DEFAULT_DOWNSIDE_THRESHOLD,
+        help=(
+            "Daily minimum acceptable return used as downside-risk tau "
+            "in decimal form (default: 0)."
+        ),
     )
     parser.add_argument(
         "--batch-size",
@@ -838,7 +973,8 @@ def main() -> None:
         batch_size=args.batch_size,
         max_retries=args.max_retries,
     )
-    as_of_date = _portfolio_date(portfolio_path)
+    as_of_date = get_portfolio_date(portfolio_path)
+    portfolio_type = get_portfolio_type(portfolio_path)
 
     from port_summary import get_market_caps
 
@@ -857,9 +993,12 @@ def main() -> None:
         capital=args.capital,
         benchmark=args.benchmark,
         lookback_days=args.lookback_days,
+        downside_threshold=args.downside_threshold,
         var_confidence=args.var_confidence,
         batch_size=args.batch_size,
         max_retries=args.max_retries,
+        portfolio_type=portfolio_type,
+        factor_universe=args.factor_universe,
     )
     print(format_risk_report(report))
     output_path = write_risk_contributions(report)

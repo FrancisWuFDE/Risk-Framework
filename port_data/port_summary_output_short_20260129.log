@@ -1,0 +1,78 @@
+PORTFOLIO SUMMARY
+========================================================================
+As of                       : 2026-01-29
+Number of stocks            : 1,019
+Weighted average market cap : $61.28B
+Ticker coverage             : 1,005/1,019
+Capital                     : $148,378,698.93
+Daily return                : -0.20%
+Daily turnover              : 24.79%
+Market value                : $-148,378,698.93
+Market value change         : $-967,002.81
+
+Position differences written to: C:\Users\FrancisWu\OneDrive - Five Dimensions Energy\Risk Framework\port_data\position_diff_short_positions_20260129.csv
+
+RISK METRICS
+========================================================================================
+Long exposure            :                $0.00 (   0.00%)
+Short exposure           :     $-148,378,698.93 (-100.00%)
+Gross exposure           :      $148,378,698.93 ( 100.00%)
+Net exposure             :     $-148,378,698.93 (-100.00%)
+Beta exposure            :              -0.9721
+Annualized volatility    :               19.84%
+Daily volatility         :                1.25%
+1-day 95% VaR            :        $3,049,779.97
+Covariance coverage      :      1,005/1,019
+
+SECTOR EXPOSURES
+----------------------------------------------------------------------------------------
+                        long   short     net  gross
+sector                                             
+Financial Services     0.00% -17.83% -17.83% 17.83%
+Industrials            0.00% -16.18% -16.18% 16.18%
+Technology             0.00% -14.27% -14.27% 14.27%
+Healthcare             0.00% -11.43% -11.43% 11.43%
+Consumer Cyclical      0.00% -11.29% -11.29% 11.29%
+Real Estate            0.00%  -8.36%  -8.36%  8.36%
+Consumer Defensive     0.00%  -5.60%  -5.60%  5.60%
+Basic Materials        0.00%  -4.25%  -4.25%  4.25%
+Energy                 0.00%  -3.53%  -3.53%  3.53%
+Utilities              0.00%  -3.51%  -3.51%  3.51%
+Communication Services 0.00%  -3.51%  -3.51%  3.51%
+Unclassified           0.00%  -0.25%  -0.25%  0.25%
+
+FACTOR EXPOSURES
+----------------------------------------------------------------------------------------
+           exposure ticker_coverage
+size        -0.5004           1,005
+value       +0.1262             957
+momentum    -0.1227           1,005
+volatility  +0.2902           1,005
+liquidity   -0.3961           1,005
+
+TOP 20 COMPONENT RISK CONTRIBUTIONS
+----------------------------------------------------------------------------------------
+        weight  beta beta_contribution component_contribution percentage_contribution
+ticker                                                                               
+MPWR   -0.494% 2.237           -0.0111                +0.200%                  +1.01%
+NXPI   -0.406% 1.867           -0.0076                +0.146%                  +0.74%
+PH     -0.503% 1.344           -0.0068                +0.132%                  +0.66%
+BX     -0.421% 1.571           -0.0066                +0.131%                  +0.66%
+PLTR   -0.409% 2.080           -0.0085                +0.129%                  +0.65%
+KKR    -0.360% 1.835           -0.0066                +0.129%                  +0.65%
+HOOD   -0.294% 2.635           -0.0077                +0.126%                  +0.64%
+AMKR   -0.304% 2.096           -0.0064                +0.118%                  +0.59%
+W      -0.218% 2.575           -0.0056                +0.112%                  +0.56%
+IQV    -0.458% 1.093           -0.0050                +0.109%                  +0.55%
+ABNB   -0.423% 1.299           -0.0055                +0.103%                  +0.52%
+SGI    -0.470% 1.026           -0.0048                +0.100%                  +0.51%
+CAT    -0.444% 1.193           -0.0053                +0.099%                  +0.50%
+SMR    -0.259% 2.384           -0.0062                +0.098%                  +0.49%
+ALGN   -0.310% 1.325           -0.0041                +0.092%                  +0.46%
+WSM    -0.298% 1.456           -0.0043                +0.092%                  +0.46%
+SYF    -0.287% 1.621           -0.0046                +0.091%                  +0.46%
+OVV    -0.320% 1.472           -0.0047                +0.091%                  +0.46%
+MTSI   -0.300% 1.762           -0.0053                +0.090%                  +0.45%
+HRI    -0.233% 1.750           -0.0041                +0.090%                  +0.45%
+
+Risk contributions written to: C:\Users\FrancisWu\OneDrive - Five Dimensions Energy\Risk Framework\port_data\risk_contribution_short_positions_20260129.csv

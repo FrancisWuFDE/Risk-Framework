@@ -953,10 +953,17 @@ def format_mac3_risk_report(report: Mac3RiskReport) -> str:
 def write_mac3_factor_risk(
     report: Mac3RiskReport,
     output_directory: str | Path,
+    portfolio_type: str = "US_live_port",
 ) -> Path:
     """Write all MAC3 factor exposures and risk contributions to CSV."""
+    from construct_port import get_portfolio_output_filename
+
     output_path = Path(output_directory).resolve() / (
-        f"mac3_factor_risk_{report.as_of_date:%Y%m%d}.csv"
+        get_portfolio_output_filename(
+            prefix="mac3_factor_risk",
+            portfolio_type=portfolio_type,
+            as_of_date=report.as_of_date,
+        )
     )
     report.factor_risk.to_csv(output_path, index=True)
     return output_path

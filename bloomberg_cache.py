@@ -20,6 +20,7 @@ DEFAULT_BATCH_SIZE = 50
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_CACHE_LOOKBACK_DAYS = 252
 DEFAULT_BENCHMARK = "VTHR"
+DEFAULT_FACTOR_UNIVERSE = "B3000 Index"
 HISTORY_CALENDAR_MULTIPLIER = 2.25
 RETRY_BACKOFF_SECONDS = 1.0
 HISTORICAL_FIELDS_VERSION = 1
@@ -43,6 +44,8 @@ HISTORICAL_FIELDS = [
 MARKET_CAP_FIELD = "CUR_MKT_CAP"
 MARKET_CAP_MULTIPLIER = 1_000_000.0
 METADATA_FIELDS = ["GICS_SECTOR_NAME", "PX_TO_BOOK_RATIO"]
+INDEX_MEMBERS_FIELD = "INDX_MWEIGHT_HIST"
+INDEX_MEMBERS_DATE_OVERRIDE = "END_DATE_OVERRIDE"
 KNOWN_SECURITY_TYPES = {
     "Comdty",
     "Corp",
@@ -245,6 +248,95 @@ def _reference_data_request(
     return records
 
 
+def _index_members_request(
+    index_ticker: str,
+    as_of_date: date,
+) -> list[dict[str, Any]]:
+    """Request historical index membership from Bloomberg."""
+    with _reference_data_session() as (blpapi, session, service):
+        request = service.createRequest("ReferenceDataRequest")
+        request.append("securities", _bloomberg_security(index_ticker))
+        request.append("fields", INDEX_MEMBERS_FIELD)
+        override = request.getElement("overrides").appendElement()
+        override.setElement("fieldId", INDEX_MEMBERS_DATE_OVERRIDE)
+        override.setElement("value", as_of_date.strftime("%Y%m%d"))
+        payloads = _send_request(blpapi, session, request)
+
+    members: list[dict[str, Any]] = []
+    for payload in payloads:
+        for security_data in _normalize_payload(
+            payload.get("securityData")
+        ):
+            if (
+                not isinstance(security_data, dict)
+                or security_data.get("securityError")
+            ):
+                continue
+            field_data = security_data.get("fieldData", {})
+            if not isinstance(field_data, dict):
+                continue
+            for member in _normalize_payload(
+                field_data.get(INDEX_MEMBERS_FIELD)
+            ):
+                if isinstance(member, dict):
+                    members.append(member)
+
+    return members
+
+
+def _normalize_index_member_ticker(value: Any) -> str | None:
+    """Convert a Bloomberg index-member identifier to a portfolio ticker."""
+    if value is None:
+        return None
+
+    tokens = str(value).strip().split()
+    if not tokens:
+        return None
+    if tokens[-1] in KNOWN_SECURITY_TYPES:
+        tokens.pop()
+    if len(tokens) > 1 and len(tokens[-1]) == 2:
+        tokens.pop()
+    return " ".join(tokens) or None
+
+
+def _parse_index_members(records: list[dict[str, Any]]) -> pd.Series:
+    """Return normalized tickers and weights from a Bloomberg bulk field."""
+    member_fields = (
+        "Member Ticker and Exchange Code",
+        "Member Ticker",
+        "Index Member",
+        "Member",
+        "Security",
+    )
+    weight_fields = (
+        "Percent Weight",
+        "Percentage Weight",
+        "Weight",
+    )
+    weights: dict[str, float] = {}
+
+    for record in records:
+        raw_member = next(
+            (record.get(field) for field in member_fields if field in record),
+            None,
+        )
+        ticker = _normalize_index_member_ticker(raw_member)
+        if ticker is None:
+            continue
+        raw_weight = next(
+            (record.get(field) for field in weight_fields if field in record),
+            None,
+        )
+        weights[ticker] = _as_float(raw_weight)
+
+    return pd.Series(
+        weights,
+        index=pd.Index(weights, name="ticker"),
+        dtype="float64",
+        name="index_weight",
+    )
+
+
 def initialize_price_database(
     database: str | Path = PRICE_DATABASE,
 ) -> Path:
@@ -323,9 +415,137 @@ def initialize_price_database(
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS index_memberships (
+                index_ticker TEXT NOT NULL,
+                as_of_date TEXT NOT NULL,
+                member_ticker TEXT NOT NULL,
+                index_weight REAL,
+                retrieved_at TEXT NOT NULL,
+                PRIMARY KEY (index_ticker, as_of_date, member_ticker)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_index_memberships_date
+            ON index_memberships (index_ticker, as_of_date)
+            """
+        )
         connection.commit()
 
     return database_path
+
+
+def load_index_members(
+    index_ticker: str,
+    as_of_date: date,
+    database: str | Path = BLOOMBERG_DATABASE,
+) -> pd.Series:
+    """Return cached members and weights for one index date."""
+    database_path = initialize_price_database(database)
+    with closing(sqlite3.connect(database_path)) as connection:
+        frame = pd.read_sql_query(
+            """
+            SELECT member_ticker, index_weight
+            FROM index_memberships
+            WHERE index_ticker = ? AND as_of_date = ?
+            ORDER BY member_ticker
+            """,
+            connection,
+            params=[index_ticker, as_of_date.isoformat()],
+        )
+
+    if frame.empty:
+        return pd.Series(dtype="float64", name="index_weight")
+    return frame.set_index("member_ticker")["index_weight"].rename_axis(
+        "ticker"
+    )
+
+
+def upsert_index_members(
+    index_ticker: str,
+    as_of_date: date,
+    members: pd.Series,
+    database: str | Path = BLOOMBERG_DATABASE,
+) -> None:
+    """Store one dated index-membership snapshot."""
+    if members.empty:
+        return
+
+    retrieved_at = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+    rows = [
+        (
+            index_ticker,
+            as_of_date.isoformat(),
+            str(ticker),
+            None if pd.isna(weight) else float(weight),
+            retrieved_at,
+        )
+        for ticker, weight in members.items()
+    ]
+    database_path = initialize_price_database(database)
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executemany(
+            """
+            INSERT INTO index_memberships (
+                index_ticker,
+                as_of_date,
+                member_ticker,
+                index_weight,
+                retrieved_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (index_ticker, as_of_date, member_ticker) DO UPDATE SET
+                index_weight = excluded.index_weight,
+                retrieved_at = excluded.retrieved_at
+            """,
+            rows,
+        )
+        connection.commit()
+
+
+def get_index_members(
+    index_ticker: str,
+    as_of_date: date,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    database: str | Path = BLOOMBERG_DATABASE,
+    allow_download: bool = True,
+) -> pd.Series:
+    """Return a cached or downloaded point-in-time index membership."""
+    if max_retries < 0:
+        raise ValueError("max_retries cannot be negative.")
+
+    members = load_index_members(index_ticker, as_of_date, database)
+    if not members.empty:
+        return members
+    if not allow_download:
+        raise LookupError(
+            f"No {index_ticker} membership is cached for {as_of_date}. "
+            "Run without --cache-only to download it first."
+        )
+
+    records: list[dict[str, Any]] = []
+    for attempt in range(max_retries + 1):
+        try:
+            records = _index_members_request(index_ticker, as_of_date)
+            break
+        except (RuntimeError, TimeoutError):
+            if attempt == max_retries:
+                raise
+            time.sleep(RETRY_BACKOFF_SECONDS * (2**attempt))
+
+    members = _parse_index_members(records)
+    if members.empty:
+        raise RuntimeError(
+            f"Bloomberg returned no {index_ticker} members for "
+            f"{as_of_date} using {INDEX_MEMBERS_FIELD}."
+        )
+    upsert_index_members(index_ticker, as_of_date, members, database)
+    return members
 
 
 def _download_price_batch(
@@ -870,6 +1090,12 @@ def get_historical_market_caps(
 
     missing_tickers = market_caps.index[market_caps.isna()]
     if len(missing_tickers) == len(market_caps):
+        if not allow_download:
+            raise RuntimeError(
+                "No historical market caps are cached for "
+                f"{as_of_date.isoformat()}. Run without --cache-only to "
+                "download them first."
+            )
         raise RuntimeError(
             "Bloomberg did not return historical market caps for any ticker."
         )
@@ -877,9 +1103,13 @@ def get_historical_market_caps(
         preview = ", ".join(missing_tickers[:10])
         if len(missing_tickers) > 10:
             preview = f"{preview}, ..."
+        source_message = (
+            "The local cache does not contain historical market caps for "
+            if not allow_download
+            else "Bloomberg did not return historical market caps for "
+        )
         warnings.warn(
-            "Bloomberg did not return historical market caps for "
-            f"{len(missing_tickers)} ticker(s): {preview}",
+            f"{source_message}{len(missing_tickers)} ticker(s): {preview}",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -1060,18 +1290,24 @@ def _resolve_cache_portfolios(
     csv_files: list[Path],
 ) -> list[Path]:
     """Resolve explicit portfolios or discover every portfolio in port_data."""
-    from construct_port import PORTFOLIO_DATA_DIR, resolve_portfolio_path
+    from construct_port import (
+        PORTFOLIO_DATA_DIR,
+        PORTFOLIO_FILENAME_PATTERN,
+        resolve_portfolio_path,
+    )
 
     if csv_files:
         return [resolve_portfolio_path(csv_file) for csv_file in csv_files]
 
     portfolio_paths = sorted(
-        PORTFOLIO_DATA_DIR.glob("US_live_port_*.csv")
+        portfolio_path
+        for portfolio_path in PORTFOLIO_DATA_DIR.glob("*.csv")
+        if PORTFOLIO_FILENAME_PATTERN.fullmatch(portfolio_path.name)
     )
     if not portfolio_paths:
         raise FileNotFoundError(
-            f"No US_live_port_YYYYMMDD.csv files found in "
-            f"{PORTFOLIO_DATA_DIR}."
+            "No full, long-only, or short-only dated portfolio CSVs "
+            f"found in {PORTFOLIO_DATA_DIR}."
         )
     return portfolio_paths
 
@@ -1089,8 +1325,8 @@ def main() -> None:
         nargs="*",
         type=Path,
         help=(
-            "Portfolio CSVs to include. If omitted, all "
-            "US_live_port_*.csv files in port_data are used."
+            "Portfolio CSVs to include. If omitted, every supported "
+            "dated portfolio CSV in port_data is used."
         ),
     )
     parser.add_argument(
@@ -1122,6 +1358,14 @@ def main() -> None:
         "--benchmark",
         default=DEFAULT_BENCHMARK,
         help="Benchmark ticker to cache (default: VTHR).",
+    )
+    parser.add_argument(
+        "--factor-universe",
+        default=DEFAULT_FACTOR_UNIVERSE,
+        help=(
+            "Bloomberg index whose members define the custom-factor "
+            f"normalization universe (default: {DEFAULT_FACTOR_UNIVERSE})."
+        ),
     )
     parser.add_argument(
         "--batch-size",
@@ -1188,9 +1432,35 @@ def main() -> None:
         parser.error("--start-date cannot be after --end-date.")
 
     portfolio_tickers = pd.Index([], dtype="object", name="ticker")
-    for _, _, shares in selected_portfolios:
+    portfolio_tickers_by_date: dict[date, pd.Index] = {}
+    for _, portfolio_date, shares in selected_portfolios:
         portfolio_tickers = portfolio_tickers.union(shares.index)
-    history_tickers = portfolio_tickers.union(
+        existing_tickers = portfolio_tickers_by_date.get(
+            portfolio_date,
+            pd.Index([], dtype="object", name="ticker"),
+        )
+        portfolio_tickers_by_date[portfolio_date] = (
+            existing_tickers.union(shares.index)
+        )
+
+    factor_tickers = portfolio_tickers.copy()
+    factor_tickers_by_date: dict[date, pd.Index] = {}
+    for portfolio_date, dated_portfolio_tickers in sorted(
+        portfolio_tickers_by_date.items()
+    ):
+        universe_members = get_index_members(
+            index_ticker=args.factor_universe,
+            as_of_date=portfolio_date,
+            max_retries=args.max_retries,
+            database=args.database,
+        )
+        dated_factor_tickers = universe_members.index.union(
+            dated_portfolio_tickers
+        )
+        factor_tickers_by_date[portfolio_date] = dated_factor_tickers
+        factor_tickers = factor_tickers.union(dated_factor_tickers)
+
+    history_tickers = factor_tickers.union(
         pd.Index([args.benchmark], name="ticker")
     )
 
@@ -1203,16 +1473,18 @@ def main() -> None:
         max_retries=args.max_retries,
         database=database_path,
     )
-    for _, portfolio_date, shares in selected_portfolios:
+    for portfolio_date, dated_factor_tickers in sorted(
+        factor_tickers_by_date.items()
+    ):
         get_historical_market_caps(
-            tickers=shares.index,
+            tickers=dated_factor_tickers,
             as_of_date=portfolio_date,
             batch_size=args.batch_size,
             max_retries=args.max_retries,
             database=database_path,
         )
     get_security_metadata(
-        tickers=portfolio_tickers,
+        tickers=factor_tickers,
         batch_size=args.batch_size,
         max_retries=args.max_retries,
         database=database_path,
