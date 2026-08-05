@@ -36,6 +36,7 @@ from construct_port import (
 from bloomberg_cache import (
     BLOOMBERG_DATABASE,
     ensure_price_history,
+    get_price_history,
     get_historical_market_caps,
     get_security_metadata,
 )
@@ -43,6 +44,9 @@ from bloomberg_cache import (
 
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_MAX_RETRIES = 3
+DEFAULT_ADV_LOOKBACK_DAYS = 20
+DEFAULT_LIQUIDATION_PARTICIPATION_RATE = 0.10
+HISTORY_CALENDAR_MULTIPLIER = 2.25
 MarketCapProvider = Callable[[pd.Index, pd.Series, date], pd.Series]
 
 
@@ -103,6 +107,15 @@ class PortfolioSummary:
     market_value_change: float
     position_changes: pd.Series
     market_caps: pd.Series
+    adv_lookback_days: int
+    median_adv: float
+    median_dollar_adv: float
+    median_position_pct_adv: float
+    maximum_position_pct_adv: float
+    liquidation_participation_rate: float
+    median_days_to_liquidate: float
+    maximum_days_to_liquidate: float
+    adv_by_position: pd.DataFrame
 
 
 def _portfolio_date(csv_file: str | Path) -> date:
@@ -154,6 +167,134 @@ def calculate_position_changes(
     return changes
 
 
+def calculate_average_daily_volumes(
+    close_prices: pd.DataFrame,
+    volumes: pd.DataFrame,
+    lookback_days: int = DEFAULT_ADV_LOOKBACK_DAYS,
+) -> pd.DataFrame:
+    """Return trailing share ADV and average daily dollar volume."""
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be positive.")
+
+    aligned_close_prices = close_prices.reindex(
+        index=volumes.index,
+        columns=volumes.columns,
+    )
+    valid_volumes = volumes.where(volumes.gt(0))
+    volume_window = valid_volumes.tail(lookback_days)
+    dollar_volume_window = aligned_close_prices.mul(valid_volumes).tail(
+        lookback_days
+    )
+    average_daily_volume = volume_window.mean().where(
+        volume_window.count().eq(lookback_days)
+    )
+    average_daily_dollar_volume = dollar_volume_window.mean().where(
+        dollar_volume_window.count().eq(lookback_days)
+    )
+
+    return pd.DataFrame(
+        {
+            "average_daily_volume": average_daily_volume,
+            "average_daily_dollar_volume": average_daily_dollar_volume,
+        }
+    )
+
+
+def calculate_adv_by_position(
+    shares: pd.Series,
+    prices: pd.Series,
+    as_of_date: date,
+    lookback_days: int = DEFAULT_ADV_LOOKBACK_DAYS,
+    liquidation_participation_rate: float = (
+        DEFAULT_LIQUIDATION_PARTICIPATION_RATE
+    ),
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    database: str | Path = BLOOMBERG_DATABASE,
+    allow_download: bool = True,
+) -> pd.DataFrame:
+    """Return position ADV, dollar ADV, and participation ratios."""
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be positive.")
+    if not 0 < liquidation_participation_rate <= 1:
+        raise ValueError(
+            "liquidation_participation_rate must be greater than zero "
+            "and no greater than one."
+        )
+
+    start_date = as_of_date - timedelta(
+        days=math.ceil(
+            lookback_days * HISTORY_CALENDAR_MULTIPLIER
+        )
+    )
+    history = get_price_history(
+        tickers=shares.index,
+        start_date=start_date,
+        end_date=as_of_date,
+        batch_size=batch_size,
+        max_retries=max_retries,
+        database=database,
+        allow_download=allow_download,
+    )
+    close_prices = history.pivot(
+        index="date",
+        columns="ticker",
+        values="close",
+    ).sort_index()
+    volumes = history.pivot(
+        index="date",
+        columns="ticker",
+        values="volume",
+    ).sort_index()
+    average_volumes = calculate_average_daily_volumes(
+        close_prices=close_prices,
+        volumes=volumes,
+        lookback_days=lookback_days,
+    )
+
+    aligned_prices = prices.reindex(shares.index)
+    position_market_value = shares.mul(aligned_prices)
+    results = pd.DataFrame(
+        {
+            "shares": shares,
+            "price": aligned_prices,
+            "position_market_value": position_market_value,
+            "average_daily_volume": average_volumes[
+                "average_daily_volume"
+            ].reindex(shares.index),
+            "average_daily_dollar_volume": average_volumes[
+                "average_daily_dollar_volume"
+            ].reindex(shares.index),
+        },
+        index=shares.index,
+    )
+    results["position_shares_pct_adv"] = shares.abs().div(
+        results["average_daily_volume"]
+    )
+    results["position_pct_of_daily_market_volume"] = (
+        results["position_shares_pct_adv"] * 100.0
+    )
+    results["position_value_pct_dollar_adv"] = (
+        position_market_value.abs().div(
+            results["average_daily_dollar_volume"]
+        )
+    )
+    results["liquidation_participation_rate"] = (
+        liquidation_participation_rate
+    )
+    results["estimated_days_to_liquidate"] = (
+        results["position_shares_pct_adv"]
+        / liquidation_participation_rate
+    )
+    results["estimated_full_trading_days"] = results[
+        "estimated_days_to_liquidate"
+    ].map(
+        lambda value: math.ceil(value) if pd.notna(value) else pd.NA
+    ).astype("Int64")
+    results.index.name = "ticker"
+    return results.sort_index()
+
+
 def write_position_changes(
     summary: PortfolioSummary,
     output_dir: str | Path = PORTFOLIO_DATA_DIR,
@@ -166,6 +307,24 @@ def write_position_changes(
     )
     changes = summary.position_changes.rename("shares_difference").to_frame()
     changes.to_csv(output_path, index=True, index_label="ticker")
+    return output_path
+
+
+def write_adv_by_position(
+    summary: PortfolioSummary,
+    output_dir: str | Path = PORTFOLIO_DATA_DIR,
+) -> Path:
+    """Write dated ticker-level ADV and participation calculations."""
+    output_directory = Path(output_dir)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    output_path = output_directory / (
+        f"adv_by_position_{summary.as_of_date:%Y%m%d}.csv"
+    )
+    summary.adv_by_position.to_csv(
+        output_path,
+        index=True,
+        index_label="ticker",
+    )
     return output_path
 
 
@@ -309,6 +468,10 @@ def create_portfolio_summary(
     price_batch_size: int = DEFAULT_BATCH_SIZE,
     price_max_retries: int = DEFAULT_MAX_RETRIES,
     allow_price_download: bool = True,
+    adv_lookback_days: int = DEFAULT_ADV_LOOKBACK_DAYS,
+    liquidation_participation_rate: float = (
+        DEFAULT_LIQUIDATION_PARTICIPATION_RATE
+    ),
 ) -> PortfolioSummary:
     """Calculate current and day-over-day portfolio summary metrics."""
     today_path = resolve_portfolio_path(today_csv)
@@ -335,6 +498,19 @@ def create_portfolio_summary(
         raise ValueError(
             "Previous-day shares cannot contain missing values."
         )
+
+    adv_by_position = calculate_adv_by_position(
+        shares=today_shares,
+        prices=today_prices,
+        as_of_date=as_of_date,
+        lookback_days=adv_lookback_days,
+        liquidation_participation_rate=(
+            liquidation_participation_rate
+        ),
+        batch_size=price_batch_size,
+        max_retries=price_max_retries,
+        allow_download=allow_price_download,
+    )
 
     missing_today_prices = int(today_prices.isna().sum())
     missing_previous_prices = int(previous_prices.isna().sum())
@@ -376,6 +552,10 @@ def create_portfolio_summary(
     previous_market_value = float(
         previous_shares.mul(previous_prices).sum(min_count=1)
     )
+    valid_adv = (
+        adv_by_position["average_daily_volume"].notna()
+        & adv_by_position["average_daily_dollar_volume"].notna()
+    )
 
     return PortfolioSummary(
         as_of_date=as_of_date,
@@ -386,6 +566,7 @@ def create_portfolio_summary(
             (
                 today_prices.notna()
                 & market_caps.reindex(today_shares.index).notna()
+                & valid_adv.reindex(today_shares.index, fill_value=False)
             ).sum()
         ),
         capital=capital_used,
@@ -408,6 +589,47 @@ def create_portfolio_summary(
             previous_shares=previous_shares,
         ),
         market_caps=market_caps,
+        adv_lookback_days=adv_lookback_days,
+        median_adv=float(
+            adv_by_position.loc[
+                valid_adv,
+                "average_daily_volume",
+            ].median()
+        ),
+        median_dollar_adv=float(
+            adv_by_position.loc[
+                valid_adv,
+                "average_daily_dollar_volume",
+            ].median()
+        ),
+        median_position_pct_adv=float(
+            adv_by_position.loc[
+                valid_adv,
+                "position_shares_pct_adv",
+            ].median()
+        ),
+        maximum_position_pct_adv=float(
+            adv_by_position.loc[
+                valid_adv,
+                "position_shares_pct_adv",
+            ].max()
+        ),
+        liquidation_participation_rate=(
+            liquidation_participation_rate
+        ),
+        median_days_to_liquidate=float(
+            adv_by_position.loc[
+                valid_adv,
+                "estimated_days_to_liquidate",
+            ].median()
+        ),
+        maximum_days_to_liquidate=float(
+            adv_by_position.loc[
+                valid_adv,
+                "estimated_days_to_liquidate",
+            ].max()
+        ),
+        adv_by_position=adv_by_position,
     )
 
 
@@ -439,6 +661,32 @@ def format_portfolio_summary(summary: PortfolioSummary) -> str:
         (
             "Ticker coverage",
             f"{summary.ticker_coverage:,}/{summary.number_of_stocks:,}",
+        ),
+        ("ADV lookback", f"{summary.adv_lookback_days} trading days"),
+        ("Median share ADV", f"{summary.median_adv:,.0f}"),
+        (
+            "Median dollar ADV",
+            _format_dollars(summary.median_dollar_adv),
+        ),
+        (
+            "Median % daily volume",
+            f"{summary.median_position_pct_adv:.2%}",
+        ),
+        (
+            "Maximum % daily volume",
+            f"{summary.maximum_position_pct_adv:.2%}",
+        ),
+        (
+            "Liquidation participation cap",
+            f"{summary.liquidation_participation_rate:.2%}",
+        ),
+        (
+            "Median days to liquidate",
+            f"{summary.median_days_to_liquidate:,.2f}",
+        ),
+        (
+            "Maximum days to liquidate",
+            f"{summary.maximum_days_to_liquidate:,.2f}",
         ),
         ("Capital", _format_dollars(summary.capital)),
         ("Daily return", f"{summary.daily_return:.2%}"),
@@ -506,6 +754,21 @@ def main() -> None:
         help="Trading-day lookback for risk metrics (default: 252).",
     )
     parser.add_argument(
+        "--adv-lookback-days",
+        type=int,
+        default=DEFAULT_ADV_LOOKBACK_DAYS,
+        help="Trading-day lookback for ADV calculations (default: 20).",
+    )
+    parser.add_argument(
+        "--liquidation-participation-rate",
+        type=float,
+        default=DEFAULT_LIQUIDATION_PARTICIPATION_RATE,
+        help=(
+            "Maximum fraction of ADV traded per day when estimating "
+            "liquidation time (default: 0.10)."
+        ),
+    )
+    parser.add_argument(
         "--minimum-observations",
         type=int,
         default=60,
@@ -532,7 +795,6 @@ def main() -> None:
     args = parser.parse_args()
 
     from risk_metrics import (
-        HISTORY_CALENDAR_MULTIPLIER,
         create_risk_report,
         format_risk_report,
         write_risk_contributions,
@@ -549,7 +811,8 @@ def main() -> None:
     )
     price_start_date = as_of_date - timedelta(
         days=math.ceil(
-            args.risk_lookback_days * HISTORY_CALENDAR_MULTIPLIER
+            max(args.risk_lookback_days, args.adv_lookback_days)
+            * HISTORY_CALENDAR_MULTIPLIER
         )
     )
     ensure_price_history(
@@ -579,10 +842,16 @@ def main() -> None:
         price_batch_size=args.batch_size,
         price_max_retries=args.max_retries,
         allow_price_download=False,
+        adv_lookback_days=args.adv_lookback_days,
+        liquidation_participation_rate=(
+            args.liquidation_participation_rate
+        ),
     )
     print(format_portfolio_summary(summary))
     output_path = write_position_changes(summary)
     print(f"\nPosition differences written to: {output_path}")
+    adv_output_path = write_adv_by_position(summary)
+    print(f"\nADV by position written to: {adv_output_path}")
 
     today_prices = load_prices(
         today_path,

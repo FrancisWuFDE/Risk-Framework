@@ -339,6 +339,8 @@ Useful options:
 python .\port_summary.py US_live_port_20260130.csv `
     --benchmark VTHR `
     --risk-lookback-days 252 `
+    --adv-lookback-days 20 `
+    --liquidation-participation-rate 0.10 `
     --minimum-observations 60 `
     --var-confidence 0.95 `
     --batch-size 50 `
@@ -373,6 +375,12 @@ Let shares be `q_i`, closing price be `P_i`, and capital be `C`.
 
 The number of unique tickers in the current portfolio. It is not the number of
 shares.
+
+### Ticker coverage
+
+A ticker is covered when it has a current price, market capitalization, and a
+complete share-ADV and dollar-ADV lookback window. Positions with incomplete
+coverage remain in the dated position-level CSVs.
 
 ### Capital
 
@@ -438,6 +446,51 @@ Missing positions are treated as zero. Nonzero differences are written to:
 ```text
 port_data/position_diff_YYYYMMDD.csv
 ```
+
+### Average daily volume by position
+
+The default ADV window is 20 trading days and can be changed with
+`--adv-lookback-days`. For each current position:
+
+```text
+share ADV_i = mean(volume_i,t) over the trailing window
+dollar ADV_i = mean(close_i,t * volume_i,t) over the trailing window
+position shares / ADV_i = |shares_i| / share ADV_i
+position value / dollar ADV_i = |shares_i * current price_i| / dollar ADV_i
+percent of daily market volume_i = 100 * |shares_i| / share ADV_i
+estimated liquidation days_i = (|shares_i| / share ADV_i)
+                               / daily participation rate
+```
+
+The default liquidation participation rate is `0.10`, meaning the estimate
+assumes the portfolio can trade up to 10% of each stock's normal daily share
+volume per day. For example, a position equal to 25% of ADV has an estimated
+liquidation time of `0.25 / 0.10 = 2.5` trading days, or three whole trading
+days when rounded up. Change the assumption with
+`--liquidation-participation-rate`; supply it as a decimal, such as `0.05` for
+5% or `0.20` for 20%.
+
+The report requires a complete lookback window for each ADV value. Every
+portfolio ticker is included in the output; positions without enough valid
+Bloomberg `PX_VOLUME` and `PX_LAST` observations have blank ADV fields. The
+complete position table is written to:
+
+```text
+port_data/adv_by_position_YYYYMMDD.csv
+```
+
+The CSV contains shares, current price, signed position market value, share
+ADV, dollar ADV, both position-to-ADV participation ratios, the explicit
+percentage of average daily market volume, the assumed participation cap, and
+estimated fractional and whole trading days to liquidate. Short-position
+ratios use the absolute position size.
+
+Here, “percent of the market” means percent of the stock's trailing average
+daily reported trading volume—not percent of shares outstanding and not a
+guarantee that this volume is immediately executable. The estimate assumes
+volume and trading capacity remain constant. It does not model bid-ask spread,
+market impact, intraday volume patterns, halts, borrow constraints, or changing
+market conditions.
 
 ## Risk calculations
 
