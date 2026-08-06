@@ -1928,12 +1928,18 @@ def main() -> None:
     for portfolio_date, dated_portfolio_tickers in sorted(
         portfolio_tickers_by_date.items()
     ):
-        universe_members = get_index_members(
-            index_ticker=args.factor_universe,
-            as_of_date=portfolio_date,
-            max_retries=args.max_retries,
-            database=args.database,
+        # Prefer an imported workbook snapshot for this portfolio date.
+        # By default do not call Bloomberg index-membership APIs; instead
+        # use only portfolio tickers and any provided workbook members.
+        snapshot = next(
+            (s for s in imported_snapshots if s.as_of_date == portfolio_date),
+            None,
         )
+        if snapshot is not None:
+            universe_members = snapshot.members
+        else:
+            universe_members = pd.Series(dtype="float64")
+
         dated_factor_tickers = universe_members.index.union(
             dated_portfolio_tickers
         )
