@@ -5,13 +5,17 @@ from __future__ import annotations
 import argparse
 import importlib
 import math
+import re
 import sqlite3
 import time
 import warnings
 from contextlib import closing, contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
+from xml.etree import ElementTree
+from zipfile import BadZipFile, ZipFile
 
 import pandas as pd
 
@@ -58,6 +62,25 @@ KNOWN_SECURITY_TYPES = {
     "Muni",
     "Pfd",
 }
+FIGI_PATTERN = re.compile(r"BBG[0-9A-Z]{9}")
+SPREADSHEET_NAMESPACE = (
+    "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+)
+OFFICE_RELATIONSHIPS_NAMESPACE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+)
+PACKAGE_RELATIONSHIPS_NAMESPACE = (
+    "http://schemas.openxmlformats.org/package/2006/relationships"
+)
+
+
+@dataclass(frozen=True)
+class FactorUniverseSnapshot:
+    """Represent one dated factor-universe membership snapshot."""
+
+    as_of_date: date
+    benchmark_name: str
+    members: pd.Series
 
 
 def _load_blpapi() -> Any:
@@ -76,6 +99,11 @@ def _bloomberg_security(ticker: str) -> str:
     normalized = str(ticker).strip()
     if not normalized:
         raise ValueError("Ticker values cannot be blank.")
+
+    if normalized.startswith("/"):
+        return normalized
+    if FIGI_PATTERN.fullmatch(normalized.upper()):
+        return f"/bbgid/{normalized.upper()}"
 
     final_token = normalized.rsplit(maxsplit=1)[-1]
     if final_token in KNOWN_SECURITY_TYPES:
@@ -101,6 +129,27 @@ def _as_float(value: Any) -> float:
         return math.nan
 
     return numeric if math.isfinite(numeric) else math.nan
+
+
+def _resolve_requested_identifier(
+    security_data: dict[str, Any],
+    securities: dict[str, str],
+    requested_identifiers: list[str],
+) -> str | None:
+    """Map a Bloomberg response back to the caller's identifier."""
+    response_security = str(security_data.get("security", ""))
+    identifier = securities.get(response_security)
+    if identifier is not None:
+        return identifier
+
+    sequence_number = security_data.get("sequenceNumber")
+    try:
+        sequence_index = int(sequence_number)
+    except (TypeError, ValueError):
+        return None
+    if 0 <= sequence_index < len(requested_identifiers):
+        return requested_identifiers[sequence_index]
+    return None
 
 
 @contextmanager
@@ -166,9 +215,10 @@ def _historical_data_request(
     end_date: date,
 ) -> list[dict[str, Any]]:
     """Request daily historical Bloomberg fields for a ticker batch."""
+    requested_identifiers = list(tickers)
     securities = {
         _bloomberg_security(ticker): ticker
-        for ticker in tickers
+        for ticker in requested_identifiers
     }
 
     with _reference_data_session() as (blpapi, session, service):
@@ -190,8 +240,11 @@ def _historical_data_request(
         ):
             if not isinstance(security_data, dict):
                 continue
-            security = str(security_data.get("security", ""))
-            ticker = securities.get(security)
+            ticker = _resolve_requested_identifier(
+                security_data=security_data,
+                securities=securities,
+                requested_identifiers=requested_identifiers,
+            )
             if ticker is None or security_data.get("securityError"):
                 continue
 
@@ -212,9 +265,10 @@ def _reference_data_request(
     fields: list[str],
 ) -> list[dict[str, Any]]:
     """Request Bloomberg reference fields for a ticker batch."""
+    requested_identifiers = list(tickers)
     securities = {
         _bloomberg_security(ticker): ticker
-        for ticker in tickers
+        for ticker in requested_identifiers
     }
 
     with _reference_data_session() as (blpapi, session, service):
@@ -232,8 +286,11 @@ def _reference_data_request(
         ):
             if not isinstance(security_data, dict):
                 continue
-            security = str(security_data.get("security", ""))
-            ticker = securities.get(security)
+            ticker = _resolve_requested_identifier(
+                security_data=security_data,
+                securities=securities,
+                requested_identifiers=requested_identifiers,
+            )
             field_data = security_data.get("fieldData", {})
             if (
                 ticker is None
@@ -335,6 +392,336 @@ def _parse_index_members(records: list[dict[str, Any]]) -> pd.Series:
         dtype="float64",
         name="index_weight",
     )
+
+
+def _xlsx_column_number(cell_reference: str) -> int:
+    """Return a one-based column number from an Excel cell reference."""
+    match = re.match(r"[A-Z]+", cell_reference.upper())
+    if match is None:
+        raise ValueError(
+            f"Invalid Excel cell reference: {cell_reference!r}."
+        )
+
+    column_number = 0
+    for character in match.group(0):
+        column_number = column_number * 26 + ord(character) - 64
+    return column_number
+
+
+def _xlsx_cell_value(
+    cell: ElementTree.Element,
+    shared_strings: list[str],
+) -> Any:
+    """Decode one cell from the XML inside an XLSX workbook."""
+    namespace = {"main": SPREADSHEET_NAMESPACE}
+    cell_type = cell.get("t")
+    if cell_type == "inlineStr":
+        return "".join(
+            text.text or ""
+            for text in cell.findall(".//main:t", namespace)
+        )
+
+    value = cell.find("main:v", namespace)
+    if value is None or value.text is None:
+        return None
+    if cell_type == "s":
+        return shared_strings[int(value.text)]
+    if cell_type in {"str", "e"}:
+        return value.text
+    if cell_type == "b":
+        return value.text == "1"
+
+    try:
+        return float(value.text)
+    except ValueError:
+        return value.text
+
+
+def _read_xlsx_worksheets(
+    workbook_path: Path,
+) -> list[tuple[str, list[tuple[int, dict[int, Any]]]]]:
+    """Read worksheet cell values using only the Python standard library."""
+    if not workbook_path.is_file():
+        raise FileNotFoundError(
+            f"Factor-universe workbook does not exist: {workbook_path}"
+        )
+    if workbook_path.suffix.lower() != ".xlsx":
+        raise ValueError(
+            "Factor-universe workbooks must use the .xlsx format."
+        )
+
+    spreadsheet_namespace = {"main": SPREADSHEET_NAMESPACE}
+    package_namespace = {"package": PACKAGE_RELATIONSHIPS_NAMESPACE}
+    relationship_attribute = (
+        f"{{{OFFICE_RELATIONSHIPS_NAMESPACE}}}id"
+    )
+
+    try:
+        with ZipFile(workbook_path) as workbook:
+            shared_strings: list[str] = []
+            if "xl/sharedStrings.xml" in workbook.namelist():
+                shared_root = ElementTree.fromstring(
+                    workbook.read("xl/sharedStrings.xml")
+                )
+                shared_strings = [
+                    "".join(
+                        text.text or ""
+                        for text in item.findall(
+                            ".//main:t",
+                            spreadsheet_namespace,
+                        )
+                    )
+                    for item in shared_root.findall(
+                        "main:si",
+                        spreadsheet_namespace,
+                    )
+                ]
+
+            workbook_root = ElementTree.fromstring(
+                workbook.read("xl/workbook.xml")
+            )
+            relationship_root = ElementTree.fromstring(
+                workbook.read("xl/_rels/workbook.xml.rels")
+            )
+            relationship_targets = {
+                relationship.get("Id"): relationship.get("Target")
+                for relationship in relationship_root.findall(
+                    "package:Relationship",
+                    package_namespace,
+                )
+            }
+
+            worksheets: list[
+                tuple[str, list[tuple[int, dict[int, Any]]]]
+            ] = []
+            for sheet in workbook_root.findall(
+                "main:sheets/main:sheet",
+                spreadsheet_namespace,
+            ):
+                relationship_id = sheet.get(relationship_attribute)
+                target = relationship_targets.get(relationship_id)
+                if target is None:
+                    continue
+                target = target.replace("\\", "/")
+                if target.startswith("/"):
+                    worksheet_name = target.lstrip("/")
+                elif target.startswith("xl/"):
+                    worksheet_name = target
+                else:
+                    worksheet_name = f"xl/{target}"
+
+                worksheet_root = ElementTree.fromstring(
+                    workbook.read(worksheet_name)
+                )
+                rows: list[tuple[int, dict[int, Any]]] = []
+                for row in worksheet_root.findall(
+                    "main:sheetData/main:row",
+                    spreadsheet_namespace,
+                ):
+                    row_number = int(row.get("r", "0"))
+                    values: dict[int, Any] = {}
+                    for cell in row.findall(
+                        "main:c",
+                        spreadsheet_namespace,
+                    ):
+                        cell_reference = cell.get("r")
+                        if cell_reference is None:
+                            continue
+                        values[_xlsx_column_number(cell_reference)] = (
+                            _xlsx_cell_value(cell, shared_strings)
+                        )
+                    rows.append((row_number, values))
+                worksheets.append((sheet.get("name", "Worksheet"), rows))
+    except (BadZipFile, ElementTree.ParseError, KeyError) as error:
+        raise ValueError(
+            f"Could not read XLSX workbook {workbook_path}: {error}"
+        ) from error
+
+    if not worksheets:
+        raise ValueError(
+            f"Factor-universe workbook has no worksheets: {workbook_path}"
+        )
+    return worksheets
+
+
+def _normalized_header(value: Any) -> str:
+    """Normalize a workbook label for case-insensitive matching."""
+    return " ".join(str(value).strip().lower().split())
+
+
+def _find_workbook_cell(
+    rows: list[tuple[int, dict[int, Any]]],
+    accepted_values: set[str],
+) -> tuple[int, int] | None:
+    """Locate the first cell whose normalized value matches a label."""
+    for row_number, values in rows:
+        for column_number, value in values.items():
+            if _normalized_header(value) in accepted_values:
+                return row_number, column_number
+    return None
+
+
+def _metadata_value_below(
+    rows: list[tuple[int, dict[int, Any]]],
+    label: str,
+) -> Any:
+    """Return the value directly below one Bloomberg export header."""
+    location = _find_workbook_cell(rows, {_normalized_header(label)})
+    if location is None:
+        raise ValueError(
+            f"Factor-universe workbook is missing the {label!r} header."
+        )
+
+    row_number, column_number = location
+    rows_by_number = dict(rows)
+    value = rows_by_number.get(row_number + 1, {}).get(column_number)
+    if value is None:
+        raise ValueError(
+            f"Factor-universe workbook has no value below {label!r}."
+        )
+    return value
+
+
+def _parse_workbook_date(value: Any) -> date:
+    """Parse a Bloomberg export date stored as text or an Excel serial."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return (date(1899, 12, 30) + timedelta(days=int(value)))
+
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        raise ValueError(
+            f"Could not parse factor-universe as-of date {value!r}."
+        )
+    return pd.Timestamp(parsed).date()
+
+
+def _canonical_universe_name(value: Any) -> str:
+    """Return a comparison key for names such as B3000 and B3000 Index."""
+    tokens = re.findall(r"[A-Z0-9]+", str(value).upper())
+    if tokens and tokens[-1] == "INDEX":
+        tokens.pop()
+    return "".join(tokens)
+
+
+def load_factor_universe_workbook(
+    workbook_path: str | Path,
+) -> FactorUniverseSnapshot:
+    """Load positive benchmark weights and FIGIs from a Bloomberg export."""
+    resolved_path = Path(workbook_path).expanduser()
+    worksheets = _read_xlsx_worksheets(resolved_path)
+
+    selected_rows: list[tuple[int, dict[int, Any]]] | None = None
+    figi_location: tuple[int, int] | None = None
+    weight_location: tuple[int, int] | None = None
+    for _, rows in worksheets:
+        candidate_figi = _find_workbook_cell(rows, {"figi"})
+        candidate_weight = _find_workbook_cell(
+            rows,
+            {"bmrk", "benchmark weight", "benchmark % weight"},
+        )
+        if candidate_figi is not None and candidate_weight is not None:
+            selected_rows = rows
+            figi_location = candidate_figi
+            weight_location = candidate_weight
+            break
+
+    if (
+        selected_rows is None
+        or figi_location is None
+        or weight_location is None
+    ):
+        raise ValueError(
+            "Factor-universe workbook must contain FIGI and Bmrk columns."
+        )
+
+    as_of_date = _parse_workbook_date(
+        _metadata_value_below(selected_rows, "As Of Date")
+    )
+    benchmark_name = str(
+        _metadata_value_below(selected_rows, "Benchmark Name")
+    ).strip()
+    first_data_row = max(figi_location[0], weight_location[0]) + 1
+    figi_column = figi_location[1]
+    weight_column = weight_location[1]
+
+    observed_figis: set[str] = set()
+    member_weights: dict[str, float] = {}
+    for row_number, values in selected_rows:
+        if row_number < first_data_row:
+            continue
+        figi = str(values.get(figi_column, "")).strip().upper()
+        if not FIGI_PATTERN.fullmatch(figi):
+            continue
+        if figi in observed_figis:
+            raise ValueError(
+                f"Duplicate FIGI {figi} in factor-universe workbook."
+            )
+        observed_figis.add(figi)
+
+        index_weight = _as_float(values.get(weight_column))
+        if not math.isnan(index_weight) and index_weight > 0:
+            member_weights[figi] = index_weight
+
+    if not member_weights:
+        raise ValueError(
+            "Factor-universe workbook contains no positive benchmark "
+            "weights with valid FIGIs."
+        )
+
+    members = pd.Series(
+        member_weights,
+        index=pd.Index(member_weights, name="ticker"),
+        dtype="float64",
+        name="index_weight",
+    ).sort_index()
+    total_weight = float(members.sum())
+    if 0.99 <= total_weight <= 1.01:
+        members = members.mul(100.0)
+        total_weight = float(members.sum())
+    if not 99.0 <= total_weight <= 101.0:
+        raise ValueError(
+            "Benchmark weights selected from the factor-universe workbook "
+            f"sum to {total_weight:.6f}, not approximately 100."
+        )
+
+    return FactorUniverseSnapshot(
+        as_of_date=as_of_date,
+        benchmark_name=benchmark_name,
+        members=members,
+    )
+
+
+def import_factor_universe_workbook(
+    workbook_path: str | Path,
+    index_ticker: str = DEFAULT_FACTOR_UNIVERSE,
+    database: str | Path = BLOOMBERG_DATABASE,
+    expected_as_of_date: date | None = None,
+) -> FactorUniverseSnapshot:
+    """Replace one cached universe date with a FIGI workbook snapshot."""
+    snapshot = load_factor_universe_workbook(workbook_path)
+    if (
+        expected_as_of_date is not None
+        and snapshot.as_of_date != expected_as_of_date
+    ):
+        raise ValueError(
+            f"Workbook as-of date {snapshot.as_of_date} does not match "
+            f"portfolio date {expected_as_of_date}."
+        )
+    expected_name = _canonical_universe_name(index_ticker)
+    workbook_name = _canonical_universe_name(snapshot.benchmark_name)
+    if expected_name != workbook_name:
+        raise ValueError(
+            f"Workbook benchmark {snapshot.benchmark_name!r} does not "
+            f"match --factor-universe {index_ticker!r}."
+        )
+
+    replace_index_members(
+        index_ticker=index_ticker,
+        as_of_date=snapshot.as_of_date,
+        members=snapshot.members,
+        database=database,
+    )
+    return snapshot
 
 
 def initialize_price_database(
@@ -502,6 +889,56 @@ def upsert_index_members(
             ON CONFLICT (index_ticker, as_of_date, member_ticker) DO UPDATE SET
                 index_weight = excluded.index_weight,
                 retrieved_at = excluded.retrieved_at
+            """,
+            rows,
+        )
+        connection.commit()
+
+
+def replace_index_members(
+    index_ticker: str,
+    as_of_date: date,
+    members: pd.Series,
+    database: str | Path = BLOOMBERG_DATABASE,
+) -> None:
+    """Atomically replace one dated index-membership snapshot."""
+    if members.empty:
+        raise ValueError("A replacement membership snapshot cannot be empty.")
+    if members.index.has_duplicates:
+        raise ValueError("Membership identifiers must be unique.")
+
+    retrieved_at = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+    rows = [
+        (
+            index_ticker,
+            as_of_date.isoformat(),
+            str(identifier),
+            None if pd.isna(weight) else float(weight),
+            retrieved_at,
+        )
+        for identifier, weight in members.items()
+    ]
+    database_path = initialize_price_database(database)
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute(
+            """
+            DELETE FROM index_memberships
+            WHERE index_ticker = ? AND as_of_date = ?
+            """,
+            [index_ticker, as_of_date.isoformat()],
+        )
+        connection.executemany(
+            """
+            INSERT INTO index_memberships (
+                index_ticker,
+                as_of_date,
+                member_ticker,
+                index_weight,
+                retrieved_at
+            )
+            VALUES (?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -1368,6 +1805,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--factor-universe-workbook",
+        action="append",
+        type=Path,
+        default=[],
+        help=(
+            "Bloomberg PORT XLSX export containing As Of Date, Benchmark "
+            "Name, Bmrk weight, and FIGI columns. Repeats are allowed. "
+            "Each workbook replaces the cached universe for its date."
+        ),
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
@@ -1396,9 +1844,35 @@ def main() -> None:
     if args.max_retries < 0:
         parser.error("--max-retries cannot be negative.")
 
+    imported_snapshots: list[FactorUniverseSnapshot] = []
+    for workbook_path in args.factor_universe_workbook:
+        try:
+            imported_snapshots.append(
+                import_factor_universe_workbook(
+                    workbook_path=workbook_path,
+                    index_ticker=args.factor_universe,
+                    database=args.database,
+                )
+            )
+        except (FileNotFoundError, ValueError) as error:
+            parser.error(str(error))
+
     from construct_port import get_portfolio_date, load_shares
 
     portfolio_paths = _resolve_cache_portfolios(args.portfolio_csv)
+    imported_dates = {
+        snapshot.as_of_date for snapshot in imported_snapshots
+    }
+    if imported_dates and not args.portfolio_csv:
+        portfolio_paths = [
+            portfolio_path
+            for portfolio_path in portfolio_paths
+            if get_portfolio_date(portfolio_path) in imported_dates
+        ]
+        if not portfolio_paths:
+            parser.error(
+                "No portfolio CSV matches a factor-universe workbook date."
+            )
     portfolios = [
         (
             portfolio_path,
@@ -1498,6 +1972,13 @@ def main() -> None:
     print(f"Portfolio files: {len(selected_portfolios):,}")
     print(f"Portfolio dates: {len(portfolio_dates):,}")
     print(f"Position tickers: {len(portfolio_tickers):,}")
+    print(f"Factor universe: {args.factor_universe}")
+    print(f"Factor identifiers: {len(factor_tickers):,}")
+    for snapshot in imported_snapshots:
+        print(
+            "Imported universe: "
+            f"{snapshot.as_of_date} ({len(snapshot.members):,} FIGIs)"
+        )
     print(f"Benchmark      : {args.benchmark}")
     print(f"History range  : {start_date} through {end_date}")
 

@@ -127,8 +127,8 @@ python .\bloomberg_cache.py
 When no portfolio arguments are supplied, the script discovers every valid
 full, long-only, and short-only dated portfolio CSV in `port_data`. It then:
 
-1. Downloads and caches the point-in-time B3000 membership for each selected
-   portfolio date.
+1. Loads the dated B3000 membership from SQLite, an imported PORT workbook,
+   or Bloomberg's index-membership field.
 2. Unions the B3000 members with all position tickers.
 3. Adds the VTHR benchmark.
 4. Downloads the required historical data in sequential batches of 50.
@@ -139,6 +139,41 @@ full, long-only, and short-only dated portfolio CSV in `port_data`. It then:
 The first B3000-backed preload is materially larger than a portfolio-only
 download because factor descriptors must be available across the reference
 universe. Later runs reuse the SQLite history and download only new ranges.
+
+### Import the B3000 universe from a PORT workbook
+
+Use a Bloomberg PORT export when `INDX_MWEIGHT_HIST` returns `#N/A Review` or
+`WORKFLOW_REVIEW_NEEDED`. The workbook must contain:
+
+- `As Of Date` and `Benchmark Name` metadata
+- a `Bmrk` weight column
+- a `FIGI` column
+
+Only securities with a positive benchmark weight are imported. Portfolio-only
+rows in a combined portfolio-plus-benchmark export are excluded from the
+normalization universe. The imported snapshot replaces any previously cached
+membership for the same universe and date.
+
+To import the workbook and download all required history, market caps, and
+metadata for its FIGIs, run:
+
+```powershell
+python .\bloomberg_cache.py `
+    .\port_data\US_live_port_20260129.csv `
+    --factor-universe-workbook `
+    "C:\path\to\port_weights_20260129.xlsx" `
+    --factor-universe "B3000 Index" `
+    --batch-size 50
+```
+
+The downloader sends each FIGI to Bloomberg as `/bbgid/<FIGI>`. Portfolio
+tickers are still downloaded under their normal Bloomberg equity identifiers,
+so positions outside B3000 are scored with the B3000 normalization parameters.
+
+Repeat `--factor-universe-workbook` to import several dated exports in one
+run. When workbook arguments are supplied without portfolio arguments, the
+cache script automatically selects portfolio CSVs whose dates match the
+workbook dates.
 
 By default, history ends on the latest selected portfolio date. The start date
 is inferred from the earliest selected portfolio date using a 252-trading-day
@@ -210,10 +245,11 @@ One row per ticker and trading date:
 
 ### `index_memberships`
 
-One row per index, portfolio date, and member ticker. B3000 membership is
-downloaded through Bloomberg's `INDX_MWEIGHT_HIST` bulk field with an
-`END_DATE_OVERRIDE` equal to the portfolio date. The cached membership defines
-the cross-sectional normalization universe for custom factors.
+One row per index, portfolio date, and member identifier. B3000 membership can
+be imported from a PORT workbook using FIGIs or downloaded through Bloomberg's
+`INDX_MWEIGHT_HIST` bulk field with an `END_DATE_OVERRIDE` equal to the
+portfolio date. The cached membership defines the cross-sectional
+normalization universe for custom factors.
 
 If Bloomberg does not return a total-return index for an otherwise valid price
 row, the downloader currently falls back to `PX_LAST` for that row.
@@ -338,6 +374,18 @@ After preloading Bloomberg data, run:
 ```powershell
 python .\port_summary.py .\port_data\US_live_port_20260130.csv
 ```
+
+You can also import the matching universe workbook and download missing data
+during the report run:
+
+```powershell
+python .\port_summary.py .\port_data\US_live_port_20260129.csv `
+    --factor-universe-workbook `
+    "C:\path\to\port_weights_20260129.xlsx"
+```
+
+The workbook's as-of date must equal the portfolio date. Add `--cache-only`
+only after the FIGI universe data has already been preloaded.
 
 After importing a matching MAC3 snapshot, add the model and horizon:
 

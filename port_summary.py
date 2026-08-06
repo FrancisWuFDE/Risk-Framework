@@ -42,6 +42,7 @@ from bloomberg_cache import (
     get_index_members,
     get_price_history,
     get_security_metadata,
+    import_factor_universe_workbook,
 )
 
 
@@ -796,6 +797,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--factor-universe-workbook",
+        type=Path,
+        help=(
+            "Bloomberg PORT XLSX export for today's factor universe. "
+            "Imports positive Bmrk-weight FIGIs before data collection."
+        ),
+    )
+    parser.add_argument(
         "--minimum-observations",
         type=int,
         default=60,
@@ -842,6 +851,21 @@ def main() -> None:
     portfolio_type = get_portfolio_type(today_path)
     today_shares = load_shares(today_path)
     previous_shares = load_shares(previous_path)
+    if args.factor_universe_workbook is not None:
+        try:
+            imported_snapshot = import_factor_universe_workbook(
+                workbook_path=args.factor_universe_workbook,
+                index_ticker=args.factor_universe,
+                database=BLOOMBERG_DATABASE,
+                expected_as_of_date=as_of_date,
+            )
+        except (FileNotFoundError, ValueError) as error:
+            parser.error(str(error))
+        print(
+            "Factor universe imported: "
+            f"{len(imported_snapshot.members):,} FIGIs for "
+            f"{imported_snapshot.as_of_date}"
+        )
     factor_universe_members = get_index_members(
         index_ticker=args.factor_universe,
         as_of_date=as_of_date,
