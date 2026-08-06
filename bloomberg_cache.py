@@ -63,6 +63,7 @@ KNOWN_SECURITY_TYPES = {
     "Pfd",
 }
 FIGI_PATTERN = re.compile(r"BBG[0-9A-Z]{9}")
+TICKER_PATTERN = re.compile(r"^[A-Za-z0-9._\-+/&()]+$")
 SPREADSHEET_NAMESPACE = (
     "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 )
@@ -606,32 +607,32 @@ def _canonical_universe_name(value: Any) -> str:
 def load_factor_universe_workbook(
     workbook_path: str | Path,
 ) -> FactorUniverseSnapshot:
-    """Load positive benchmark weights and FIGIs from a Bloomberg export."""
+    """Load positive benchmark weights and tickers from a Bloomberg export."""
     resolved_path = Path(workbook_path).expanduser()
     worksheets = _read_xlsx_worksheets(resolved_path)
 
     selected_rows: list[tuple[int, dict[int, Any]]] | None = None
-    figi_location: tuple[int, int] | None = None
+    ticker_location: tuple[int, int] | None = None
     weight_location: tuple[int, int] | None = None
     for _, rows in worksheets:
-        candidate_figi = _find_workbook_cell(rows, {"figi"})
+        candidate_ticker = _find_workbook_cell(rows, {"ticker", "ticker and exchange code", "security", "member ticker"})
         candidate_weight = _find_workbook_cell(
             rows,
             {"bmrk", "benchmark weight", "benchmark % weight"},
         )
-        if candidate_figi is not None and candidate_weight is not None:
+        if candidate_ticker is not None and candidate_weight is not None:
             selected_rows = rows
-            figi_location = candidate_figi
+            ticker_location = candidate_ticker
             weight_location = candidate_weight
             break
 
     if (
         selected_rows is None
-        or figi_location is None
+        or ticker_location is None
         or weight_location is None
     ):
         raise ValueError(
-            "Factor-universe workbook must contain FIGI and Bmrk columns."
+            "Factor-universe workbook must contain a ticker column and Bmrk column."
         )
 
     as_of_date = _parse_workbook_date(
@@ -640,32 +641,37 @@ def load_factor_universe_workbook(
     benchmark_name = str(
         _metadata_value_below(selected_rows, "Benchmark Name")
     ).strip()
-    first_data_row = max(figi_location[0], weight_location[0]) + 1
-    figi_column = figi_location[1]
+    first_data_row = max(ticker_location[0], weight_location[0]) + 1
+    ticker_column = ticker_location[1]
     weight_column = weight_location[1]
 
-    observed_figis: set[str] = set()
+    observed_tickers: set[str] = set()
     member_weights: dict[str, float] = {}
     for row_number, values in selected_rows:
         if row_number < first_data_row:
             continue
-        figi = str(values.get(figi_column, "")).strip().upper()
-        if not FIGI_PATTERN.fullmatch(figi):
+        raw_ticker = str(values.get(ticker_column, "")).strip()
+        if not raw_ticker:
             continue
-        if figi in observed_figis:
+        if not TICKER_PATTERN.fullmatch(raw_ticker):
+            continue
+        cleaned_ticker = _normalize_index_member_ticker(raw_ticker)
+        if cleaned_ticker is None:
+            continue
+        if cleaned_ticker in observed_tickers:
             raise ValueError(
-                f"Duplicate FIGI {figi} in factor-universe workbook."
+                f"Duplicate ticker {cleaned_ticker} in factor-universe workbook."
             )
-        observed_figis.add(figi)
+        observed_tickers.add(cleaned_ticker)
 
         index_weight = _as_float(values.get(weight_column))
         if not math.isnan(index_weight) and index_weight > 0:
-            member_weights[figi] = index_weight
+            member_weights[cleaned_ticker] = index_weight
 
     if not member_weights:
         raise ValueError(
             "Factor-universe workbook contains no positive benchmark "
-            "weights with valid FIGIs."
+            "weights with valid tickers."
         )
 
     members = pd.Series(
@@ -697,7 +703,7 @@ def import_factor_universe_workbook(
     database: str | Path = BLOOMBERG_DATABASE,
     expected_as_of_date: date | None = None,
 ) -> FactorUniverseSnapshot:
-    """Replace one cached universe date with a FIGI workbook snapshot."""
+    """Replace one cached universe date with a ticker workbook snapshot."""
     snapshot = load_factor_universe_workbook(workbook_path)
     if (
         expected_as_of_date is not None
@@ -1811,7 +1817,7 @@ def main() -> None:
         default=[],
         help=(
             "Bloomberg PORT XLSX export containing As Of Date, Benchmark "
-            "Name, Bmrk weight, and FIGI columns. Repeats are allowed. "
+            "Name, Bmrk weight, and ticker columns. Repeats are allowed. "
             "Each workbook replaces the cached universe for its date."
         ),
     )
@@ -1977,7 +1983,7 @@ def main() -> None:
     for snapshot in imported_snapshots:
         print(
             "Imported universe: "
-            f"{snapshot.as_of_date} ({len(snapshot.members):,} FIGIs)"
+            f"{snapshot.as_of_date} ({len(snapshot.members):,} tickers)"
         )
     print(f"Benchmark      : {args.benchmark}")
     print(f"History range  : {start_date} through {end_date}")

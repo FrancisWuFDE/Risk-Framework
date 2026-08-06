@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import warnings
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -199,6 +200,7 @@ def calculate_sector_exposures(
 def _zscore(
     values: pd.Series,
     normalization_tickers: pd.Index | None = None,
+    weights: pd.Series | None = None,
 ) -> pd.Series:
     """Return a z-score using a fixed cross-sectional reference universe."""
     numeric = pd.to_numeric(values, errors="coerce")
@@ -207,6 +209,11 @@ def _zscore(
         if normalization_tickers is None
         else numeric.reindex(normalization_tickers)
     )
+    if weights is not None:
+        weights = weights.astype(float)
+        if normalization_tickers is not None:
+            weights = weights.reindex(normalization_tickers)
+        weights = weights.where(reference.notna())
     valid_reference = reference.dropna()
     if len(valid_reference) < 2:
         return pd.Series(index=values.index, dtype="float64")
@@ -215,8 +222,27 @@ def _zscore(
     upper = valid_reference.quantile(0.99)
     clipped = numeric.clip(lower=lower, upper=upper)
     clipped_reference = valid_reference.clip(lower=lower, upper=upper)
-    reference_mean = clipped_reference.mean()
-    standard_deviation = clipped_reference.std(ddof=0)
+
+    if weights is None:
+        reference_mean = clipped_reference.mean()
+        standard_deviation = clipped_reference.std(ddof=0)
+    else:
+        weighted_reference = weights.reindex(clipped_reference.index)
+        weighted_reference = weighted_reference.where(weighted_reference.gt(0))
+        if weighted_reference.dropna().empty:
+            reference_mean = clipped_reference.mean()
+            standard_deviation = clipped_reference.std(ddof=0)
+        else:
+            normalization = float(weighted_reference.sum())
+            reference_mean = float(
+                (clipped_reference * weighted_reference).sum() / normalization
+            )
+            variance = float(
+                ((clipped_reference - reference_mean) ** 2 * weighted_reference).sum()
+                / normalization
+            )
+            standard_deviation = math.sqrt(max(variance, 0.0))
+
     if standard_deviation == 0 or pd.isna(standard_deviation):
         return pd.Series(0.0, index=values.index)
 
@@ -489,9 +515,11 @@ def calculate_factor_scores(
             "liquidity": illiquidity,
         }
     )
+    cap_weights = market_caps.where(market_caps.gt(0)).pow(0.5)
     return raw_factors.apply(
         _zscore,
         normalization_tickers=normalization_tickers,
+        weights=cap_weights,
     )
 
 
@@ -613,12 +641,27 @@ def create_risk_report(
         else float(capital)
     )
     weights = calculate_signed_weights(shares, prices, capital_used)
-    universe_members = get_index_members(
-        index_ticker=factor_universe,
-        as_of_date=as_of_date,
-        max_retries=max_retries,
-        allow_download=allow_price_download,
-    )
+    try:
+        universe_members = get_index_members(
+            index_ticker=factor_universe,
+            as_of_date=as_of_date,
+            max_retries=max_retries,
+            allow_download=allow_price_download,
+        )
+    except LookupError as error:
+        if allow_price_download:
+            raise
+        warnings.warn(
+            f"{error}. Falling back to the current portfolio tickers as the "
+            "normalization universe.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        universe_members = pd.Series(
+            index=weights.index,
+            dtype="float64",
+            name="index_weight",
+        )
     normalization_tickers = universe_members.index
     factor_tickers = normalization_tickers.union(weights.index)
     history_tickers = factor_tickers.union(pd.Index([benchmark]))

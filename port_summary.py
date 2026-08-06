@@ -801,7 +801,7 @@ def main() -> None:
         type=Path,
         help=(
             "Bloomberg PORT XLSX export for today's factor universe. "
-            "Imports positive Bmrk-weight FIGIs before data collection."
+            "Imports positive Bmrk-weight tickers before data collection."
         ),
     )
     parser.add_argument(
@@ -863,15 +863,30 @@ def main() -> None:
             parser.error(str(error))
         print(
             "Factor universe imported: "
-            f"{len(imported_snapshot.members):,} FIGIs for "
+            f"{len(imported_snapshot.members):,} tickers for "
             f"{imported_snapshot.as_of_date}"
         )
-    factor_universe_members = get_index_members(
-        index_ticker=args.factor_universe,
-        as_of_date=as_of_date,
-        max_retries=args.max_retries,
-        allow_download=not args.cache_only,
-    )
+    try:
+        factor_universe_members = get_index_members(
+            index_ticker=args.factor_universe,
+            as_of_date=as_of_date,
+            max_retries=args.max_retries,
+            allow_download=not args.cache_only,
+        )
+    except LookupError as error:
+        if not args.cache_only:
+            raise
+        warnings.warn(
+            f"{error}. Falling back to portfolio tickers for factor "
+            "normalization.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        factor_universe_members = pd.Series(
+            index=pd.Index([], dtype="object", name="ticker"),
+            dtype="float64",
+            name="index_weight",
+        )
     factor_tickers = factor_universe_members.index.union(
         today_shares.index
     )
